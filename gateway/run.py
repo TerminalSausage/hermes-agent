@@ -4954,6 +4954,9 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # Patch: substitute {args} with a safely-quoted argument blob.
+                        user_args = event.get_command_args().strip()
+                        exec_cmd = exec_cmd.replace("{args}", shlex.quote(user_args))
                         try:
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,

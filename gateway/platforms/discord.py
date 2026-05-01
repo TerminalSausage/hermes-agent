@@ -2458,6 +2458,110 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
+        @tree.command(name="note", description="Quick capture a note to Obsidian Inbox")
+        @discord.app_commands.describe(text="Note text to save")
+        async def slash_note(interaction: discord.Interaction, text: str):
+            if not text:
+                await interaction.response.send_message("Usage: `/note <text>`", ephemeral=True)
+                return
+            await self._run_simple_slash(interaction, f"/note {text}", "Note saved~")
+
+        @tree.command(name="btw", description="Ephemeral side question using session context")
+        @discord.app_commands.describe(question="Your side question (no tools, not persisted)")
+        async def slash_btw(interaction: discord.Interaction, question: str):
+            await self._run_simple_slash(interaction, f"/btw {question}")
+
+        from hermes_cli.profiles import get_active_profile_name
+        if get_active_profile_name().lower() == "ada":
+            def _customer_kb_root() -> _Path:
+                home = _Path.home()
+                primary = home / "Obsidian" / "SecondBrain" / "5-CustomerKB"
+                legacy = home / "Obsidian" / "SecondBrain" / "5-5-CustomerKB"
+                if primary.exists():
+                    return primary
+                if legacy.exists():
+                    return legacy
+                return primary
+
+            async def _customer_autocomplete(interaction: discord.Interaction, current: str):
+                q = (current or "").strip().lower()
+                root = _customer_kb_root()
+                names: list[tuple[str, str]] = []
+                seen: set[str] = set()
+                registry_path = root / "_config" / "customer-registry.json"
+                try:
+                    if registry_path.exists():
+                        import json as _json
+                        data = _json.loads(registry_path.read_text(encoding="utf-8"))
+                        for rec in (data.get("customers") or {}).values():
+                            name = str(rec.get("name") or "").strip()
+                            if name:
+                                key = name.lower()
+                                if key not in seen:
+                                    seen.add(key)
+                                    status = str(rec.get("status") or "").strip()
+                                    label = f"{name} — {status}" if status else name
+                                    names.append((name, label))
+                except Exception:
+                    pass
+                customers_dir = root / "Customers"
+                if customers_dir.exists():
+                    for child in sorted(customers_dir.iterdir()):
+                        if child.is_dir():
+                            name = child.name.strip()
+                            key = name.lower()
+                            if key not in seen:
+                                seen.add(key)
+                                names.append((name, name))
+                choices = []
+                for name, label in names:
+                    if not q or q in name.lower():
+                        if len(label) > 100:
+                            label = label[:97] + "..."
+                        choices.append(discord.app_commands.Choice(name=label, value=name))
+                        if len(choices) >= 25:
+                            break
+                return choices
+
+            @tree.command(name="customer", description="Manage CustomerKB customer workspaces")
+            @discord.app_commands.describe(
+                name="Customer name or list filter",
+                command="Action to perform",
+                filter_text="Optional list filter keyword",
+            )
+            @discord.app_commands.autocomplete(name=_customer_autocomplete)
+            @discord.app_commands.choices(command=[
+                discord.app_commands.Choice(name="open — relink or reopen a customer thread", value="open"),
+                discord.app_commands.Choice(name="close — archive a customer thread", value="close"),
+                discord.app_commands.Choice(name="new — create a customer folder and thread", value="new"),
+                discord.app_commands.Choice(name="list — list customers", value="list"),
+            ])
+            async def slash_customer(
+                interaction: discord.Interaction,
+                name: str,
+                command: str,
+                filter_text: str = "",
+            ):
+                if not command:
+                    await interaction.response.send_message(
+                        "Usage: `/customer <name> <open|close|new|list> [filter]`",
+                        ephemeral=True,
+                    )
+                    return
+                import shlex as _shlex
+                safe_name = _shlex.quote(name)
+                safe_filter = _shlex.quote(filter_text) if filter_text else ""
+                payload = f'--name {safe_name} --action {command}'
+                if safe_filter:
+                    payload += f' --filter {safe_filter}'
+                ack = {
+                    "open": "Opening customer workspace~",
+                    "close": "Closing customer workspace~",
+                    "new": "Creating customer workspace~",
+                    "list": "Listing customers~",
+                }.get(command, "Working~")
+                await self._run_simple_slash(interaction, f"/customer {payload}", ack)
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash

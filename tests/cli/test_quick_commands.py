@@ -66,6 +66,14 @@ class TestCLIQuickCommands:
         args = cli.console.print.call_args[0][0]
         assert "no output" in args.lower()
 
+    def test_exec_command_quoted_args_are_substituted_safely(self):
+        cli = self._make_cli({"dn": {"type": "exec", "command": "printf %s {args}"}})
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(args="", returncode=0, stdout="ok", stderr="")
+            cli.process_command("/dn hello world")
+        called_cmd = mock_run.call_args[0][0]
+        assert "'hello world'" in called_cmd or '"hello world"' in called_cmd
+
     def test_alias_command_routes_to_target(self):
         """Alias quick commands rewrite to the target command."""
         cli = self._make_cli({"shortcut": {"type": "alias", "target": "/help"}})
@@ -158,6 +166,25 @@ class TestGatewayQuickCommands:
         event = self._make_event("limits")
         result = await runner._handle_message(event)
         assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_exec_command_quoted_args_are_substituted_safely(self):
+        from gateway.run import GatewayRunner
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {"quick_commands": {"limits": {"type": "exec", "command": "printf %s {args}"}}}
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = MagicMock(return_value=True)
+
+        event = self._make_event("limits", "hello world")
+        with patch("asyncio.create_subprocess_shell") as mock_shell:
+            proc = AsyncMock()
+            proc.communicate.return_value = (b"ok", b"")
+            proc.returncode = 0
+            mock_shell.return_value = proc
+            await runner._handle_message(event)
+        called_cmd = mock_shell.call_args[0][0]
+        assert "'hello world'" in called_cmd or '"hello world"' in called_cmd
 
     @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):

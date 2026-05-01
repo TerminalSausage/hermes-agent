@@ -2478,10 +2478,11 @@ class BasePlatformAdapter(ABC):
             )
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             if _text:
+                _no_reply = os.getenv("DISCORD_NO_REPLY", "").lower() in ("true", "1", "yes")
                 _r = await self._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_text,
-                    reply_to=event.message_id,
+                    reply_to=None if _no_reply else event.message_id,
                     metadata=thread_meta,
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
@@ -2571,10 +2572,11 @@ class BasePlatformAdapter(ABC):
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
+                        _no_reply = os.getenv("DISCORD_NO_REPLY", "").lower() in ("true", "1", "yes")
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
-                            reply_to=event.message_id,
+                            reply_to=None if _no_reply else event.message_id,
                             metadata=_thread_meta,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
@@ -2778,10 +2780,11 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
+                    _no_reply = os.getenv("DISCORD_NO_REPLY", "").lower() in ("true", "1", "yes")
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
-                        reply_to=event.message_id,
+                        reply_to=None if _no_reply else event.message_id,
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)

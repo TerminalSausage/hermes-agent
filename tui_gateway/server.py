@@ -4118,8 +4118,12 @@ def _(rid, params: dict) -> dict:
     if name in qcmds:
         qc = qcmds[name]
         if qc.get("type") == "exec":
+            import shlex as _shlex
+            exec_cmd = qc.get("command", "")
+            if "{args}" in exec_cmd:
+                exec_cmd = exec_cmd.replace("{args}", _shlex.quote(arg))
             r = subprocess.run(
-                qc.get("command", ""),
+                exec_cmd,
                 shell=True,
                 capture_output=True,
                 text=True,

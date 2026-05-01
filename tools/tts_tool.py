@@ -746,12 +746,19 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     _edge_tts = _import_edge_tts()
     edge_config = tts_config.get("edge", {})
     voice = edge_config.get("voice", DEFAULT_EDGE_VOICE)
+    rate = edge_config.get("rate", tts_config.get("rate", "+0%"))
+    pitch = edge_config.get("pitch", tts_config.get("pitch", "+0Hz"))
     speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
 
     kwargs = {"voice": voice}
+    # If speed was explicitly set (not default 1.0 via fallback), it overrides rate
     if speed != 1.0:
         pct = round((speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
+    elif rate and rate != "+0%":
+        kwargs["rate"] = rate
+    if pitch and pitch != "+0Hz":
+        kwargs["pitch"] = pitch
 
     communicate = _edge_tts.Communicate(text, **kwargs)
     await communicate.save(output_path)
