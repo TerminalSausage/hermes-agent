@@ -2941,9 +2941,17 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return
-        # Don't start a duplicate loop
+        # Don't start a duplicate loop — but only if the existing task
+        # is still alive.  If Discord returned an error and the loop exited,
+        # the dead task is still in the dict; we need to replace it.
+        # See: NousResearch/hermes-agent#2831 (second path, unmerged)
         if chat_id in self._typing_tasks:
-            return
+            existing = self._typing_tasks[chat_id]
+            if not existing.done():
+                return
+            # Task is dead (e.g. HTTP error caused early exit) — clean it up
+            # so we can start a fresh loop below.
+            del self._typing_tasks[chat_id]
 
         async def _typing_loop() -> None:
             try:
