@@ -980,6 +980,10 @@ class GatewayInboundMixin:
                 exec_cmd = qcmd.get("command", "")
                 if not exec_cmd:
                     return True, f"Quick command '/{command}' has no command defined.", command
+                # Substitute {args} placeholder with user-provided arguments (fork).
+                # hasattr safety: platform adapters without get_command_args fall back to "".
+                user_args = event.get_command_args().strip() if hasattr(event, "get_command_args") else ""
+                exec_cmd = exec_cmd.replace("{args}", user_args)
                 return True, await self._hm_run_exec_quick_command(command, exec_cmd), command
             if qtype != "alias":
                 return True, f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias').", command
