@@ -67,6 +67,66 @@ from gateway.platforms.base import (
 )
 from tools.url_safety import is_safe_url
 
+from gateway.platforms.discord_components import (
+    CUSTOM_ID_PREFIX,
+    build_view_from_spec,
+    component_store,
+)
+
+
+def _normalize_component_spec(raw_spec):
+    """Normalize a component spec from the send_message tool to builder format.
+
+    The send_message tool uses the Discord API format::
+
+        [{"components": [{"type": "button", "label": "X", ...}]}]
+
+    The builder expects the friendlier format::
+
+        {"action_rows": [{"buttons": [...]}, {"select": {...}}]}
+
+    This function detects the input format and converts as needed.
+    """
+    if not raw_spec:
+        return None
+    if not isinstance(raw_spec, (list, dict)):
+        logger.warning("Component spec is not a list or dict: %r", type(raw_spec))
+        return None
+
+    # Already in builder format (has "action_rows" key)
+    if isinstance(raw_spec, dict) and "action_rows" in raw_spec:
+        return raw_spec
+
+    # API format: list of action rows, each with a "components" array
+    if isinstance(raw_spec, list):
+        action_rows = []
+        for row in raw_spec:
+            if not isinstance(row, dict):
+                continue
+            row_components = row.get("components", [])
+            buttons = []
+            select = None
+            for comp in row_components:
+                if not isinstance(comp, dict):
+                    continue
+                comp_type = comp.get("type", "button")
+                if comp_type == "button":
+                    buttons.append(comp)
+                elif comp_type in ("string_select", "select"):
+                    select = comp
+            row_dict = {}
+            if buttons:
+                row_dict["buttons"] = buttons
+            if select:
+                row_dict["select"] = select
+            if row_dict:
+                action_rows.append(row_dict)
+        if action_rows:
+            return {"action_rows": action_rows}
+
+    logger.warning("Could not normalize component spec: %r", raw_spec)
+    return None
+
 
 def _clean_discord_id(entry: str) -> str:
     """Strip common prefixes from a Discord user ID or username entry.
@@ -86,32 +146,8 @@ def _clean_discord_id(entry: str) -> str:
 
 
 def check_discord_requirements() -> bool:
-    """Check if Discord dependencies are available.
-
-    Lazy-installs discord.py via ``tools.lazy_deps.ensure("platform.discord")``
-    on first call if not present. After successful install, re-binds module
-    globals so ``DISCORD_AVAILABLE`` becomes True.
-    """
-    global DISCORD_AVAILABLE, discord, DiscordMessage, Intents, commands
-    if DISCORD_AVAILABLE:
-        return True
-    try:
-        from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("platform.discord", prompt=False)
-    except Exception:
-        return False
-    try:
-        import discord as _discord
-        from discord import Message as _DM, Intents as _Intents
-        from discord.ext import commands as _commands
-    except ImportError:
-        return False
-    discord = _discord
-    DiscordMessage = _DM
-    Intents = _Intents
-    commands = _commands
-    DISCORD_AVAILABLE = True
-    return True
+    """Check if Discord dependencies are available."""
+    return DISCORD_AVAILABLE
 
 
 def _build_allowed_mentions():
@@ -139,7 +175,7 @@ def _build_allowed_mentions():
         raw = os.getenv(name, "").strip().lower()
         if not raw:
             return default
-        return raw in {"true", "1", "yes", "on"}
+        return raw in ("true", "1", "yes", "on")
 
     return discord.AllowedMentions(
         everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
@@ -589,10 +625,6 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
-        # In-memory cache of the bot's last message ID per channel, used by
-        # history backfill to skip the full scan on hot paths.  Falls back to
-        # scanning channel.history() on cache miss (cold start / restart).
-        self._last_self_message_id: Dict[str, str] = {}
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -736,7 +768,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
-                if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+                if message.type not in (discord.MessageType.default, discord.MessageType.reply):
                     return
 
                 # Bot message filtering (DISCORD_ALLOW_BOTS):
@@ -797,7 +829,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # answer regardless of who is mentioned.
                     _ignore_no_mention = os.getenv(
                         "DISCORD_IGNORE_NO_MENTION", "true"
-                    ).lower() in {"true", "1", "yes"}
+                    ).lower() in ("true", "1", "yes")
                     if _ignore_no_mention and not _self_mentioned and not _other_bots_mentioned:
                         _channel_id = str(message.channel.id)
                         _parent_id = None
@@ -811,6 +843,162 @@ class DiscordAdapter(BasePlatformAdapter):
                             return
 
                 await self._handle_message(message)
+
+            @self._client.event
+            async def on_interaction(interaction):
+                """Handle Discord component interactions for REST-sent messages.
+
+                discord.py's View system automatically intercepts interactions
+                for messages sent via ``channel.send(view=...)`` (websocket
+                path).  But components sent via the REST API (aiohttp in
+                ``_send_discord``) have no View attached — Discord fires the
+                interaction but nobody acknowledges it, resulting in "This
+                interaction failed" errors.
+
+                This handler catches those orphaned interactions by checking
+                if the message has a registered discord.py View.  If not, it
+                looks up the message_id in the ComponentStore for REST-sent
+                entries, acknowledges the interaction, and routes it as a
+                MessageEvent.
+
+                Note: discord.py 2.x dispatches ``on_interaction`` for ALL
+                interaction types.  We only handle component interactions
+                (type 3) with no registered View.
+                """
+                # Only handle component interactions
+                if interaction.type != discord.InteractionType.component:
+                    return
+
+                message_id = str(interaction.message.id) if interaction.message else ""
+
+                # Check if discord.py has a registered View for this message.
+                # The view_store._views dict is keyed by message_id and maps
+                # to {(component_type, custom_id): Item}.  If any entry
+                # exists, a View callback will handle (or is handling) this
+                # interaction — don't interfere.
+                view_store = adapter_self._client._connection._view_store
+                if message_id and view_store._views.get(int(message_id)):
+                    return
+
+                # Check if this is an agent component we sent via REST
+                tracked = component_store.get(message_id)
+                if not tracked or not tracked.rest_sent:
+                    return
+
+                # Single-use guard: if this interaction was already handled,
+                # acknowledge and ignore (Discord requires *some* response).
+                if tracked.resolved:
+                    try:
+                        await interaction.response.defer()
+                    except Exception:
+                        pass
+                    return
+
+                # Extract component info from the interaction
+                data = interaction.data or {}
+                custom_id_raw = data.get("custom_id", "")
+                component_type = data.get("component_type", 0)
+
+                # Only handle agent components (hermes: prefix)
+                if not custom_id_raw.startswith(CUSTOM_ID_PREFIX):
+                    return
+
+                # Strip the prefix to get the original custom_id
+                original_custom_id = custom_id_raw[len(CUSTOM_ID_PREFIX):]
+
+                # Build interaction text
+                from gateway.platforms.discord_components import (
+                    _format_interaction_text,
+                )
+
+                if component_type == 2:  # Button
+                    label = data.get("label", "")
+                    kind = "Button clicked"
+                    interaction_text = _format_interaction_text(
+                        kind,
+                        label=label,
+                        custom_id=original_custom_id,
+                    )
+                elif component_type == 3:  # String Select
+                    values = data.get("values", [])
+                    kind = "Select chosen"
+                    interaction_text = _format_interaction_text(
+                        kind,
+                        label=values[0] if values else "",
+                        custom_id=original_custom_id,
+                        values=values,
+                    )
+                else:
+                    logger.debug("Unhandled component type %d in on_interaction", component_type)
+                    return
+
+                # Acknowledge the interaction — update the message to disable
+                # components (single-use behavior) and show the user we got it
+                try:
+                    channel = adapter_self._client.get_channel(int(tracked.chat_id))
+                    if channel is None:
+                        channel = await adapter_self._client.fetch_channel(int(tracked.chat_id))
+                    msg = await channel.fetch_message(int(message_id))
+
+                    # Build updated components with all items disabled
+                    updated_components = []
+                    for action_row in (msg.components or []):
+                        row_data = {}
+                        row_comps = []
+                        for comp in action_row.children:
+                            comp_dict = comp.to_dict()
+                            comp_dict["disabled"] = True
+                            row_comps.append(comp_dict)
+                        if row_comps:
+                            row_data["type"] = 1
+                            row_data["components"] = row_comps
+                            updated_components.append(row_data)
+
+                    await interaction.response.edit_message(
+                        content=msg.content,
+                        components=updated_components,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to edit REST-sent component message %s on interaction",
+                        message_id,
+                        exc_info=True,
+                    )
+                    # Fallback: at least acknowledge to prevent the error
+                    try:
+                        await interaction.response.defer()
+                    except Exception:
+                        pass
+
+                # Mark as resolved
+                tracked.resolved = True
+
+                # Route the interaction as a MessageEvent
+                from gateway.platforms.base import MessageEvent, MessageType
+
+                source = adapter_self.build_source(
+                    chat_id=tracked.chat_id,
+                    user_id=str(interaction.user.id),
+                    user_name=str(interaction.user),
+                )
+
+                event = MessageEvent(
+                    text=interaction_text,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message=interaction,
+                    message_id=message_id,
+                    reply_to_message_id=message_id,
+                )
+
+                try:
+                    await adapter_self.handle_message(event)
+                except Exception:
+                    logger.error(
+                        "Error routing REST component interaction for message %s",
+                        message_id,
+                        exc_info=True,
+                    )
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -1345,7 +1533,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        return os.getenv("DISCORD_REACTIONS", "true").lower() not in ("false", "0", "no")
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction for normal Discord message events."""
@@ -1414,6 +1602,12 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
+            # Build interactive view from component spec in metadata
+            view = None
+            component_spec = None
+            if metadata and metadata.get("components"):
+                component_spec = metadata["components"]
+
             message_ids = []
             reference = None
 
@@ -1432,11 +1626,34 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+
+                # Attach the view only to the last chunk
+                chunk_view = None
+                if i == len(chunks) - 1 and component_spec:
+                    # Build the view lazily on first use
+                    if view is None:
+                        session_key = metadata.get("session_key", "") if metadata else ""
+                        # Convert API-format spec to builder format if needed
+                        normalized = _normalize_component_spec(component_spec)
+                        view = build_view_from_spec(
+                            spec=normalized,
+                            message_id="",  # placeholder; updated after send
+                            session_key=session_key,
+                            source=None,  # set after we have channel context
+                            interaction_callback=lambda event: asyncio.ensure_future(
+                                adapter_self.handle_message(event)
+                            ),
+                        )
+                    chunk_view = view
+
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs: dict = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if chunk_view is not None:
+                        send_kwargs["view"] = chunk_view
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1455,19 +1672,33 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        send_kwargs_retry: dict = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if chunk_view is not None:
+                            send_kwargs_retry["view"] = chunk_view
+                        msg = await channel.send(**send_kwargs_retry)
                     else:
                         raise
                 message_ids.append(str(msg.id))
 
-            # Track the last message we sent in this channel for history
-            # backfill — avoids a full channel.history() scan on hot paths.
-            if message_ids:
-                _target_id = thread_id or chat_id
-                self._last_self_message_id[_target_id] = message_ids[-1]
+            # Store the view and update message_id in ComponentStore
+            if view and message_ids:
+                session_key = metadata.get("session_key", "") if metadata else ""
+                view._message_id = str(message_ids[-1])
+                # Update the view's source with actual channel/user context
+                source = self.build_source(chat_id=str(channel.id), user_id="", user_name="")
+                view._source = source
+                component_store.register(
+                    message_id=message_ids[-1],
+                    view=view,
+                    session_key=session_key,
+                    interaction_callback=lambda event: asyncio.ensure_future(
+                        self.handle_message(event)
+                    ),
+                    source=source,
+                )
 
             return SendResult(
                 success=True,
@@ -2739,8 +2970,6 @@ class DiscordAdapter(BasePlatformAdapter):
                     await asyncio.sleep(8)
             except asyncio.CancelledError:
                 pass
-            finally:
-                self._typing_tasks.pop(chat_id, None)
 
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
@@ -3065,6 +3294,110 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
+        @tree.command(name="note", description="Quick capture a note to Obsidian Inbox")
+        @discord.app_commands.describe(text="Note text to save")
+        async def slash_note(interaction: discord.Interaction, text: str):
+            if not text:
+                await interaction.response.send_message("Usage: `/note <text>`", ephemeral=True)
+                return
+            await self._run_simple_slash(interaction, f"/note {text}", "Note saved~")
+
+        @tree.command(name="btw", description="Ephemeral side question using session context")
+        @discord.app_commands.describe(question="Your side question (no tools, not persisted)")
+        async def slash_btw(interaction: discord.Interaction, question: str):
+            await self._run_simple_slash(interaction, f"/btw {question}")
+
+        from hermes_cli.profiles import get_active_profile_name
+        if get_active_profile_name().lower() == "ada":
+            def _customer_kb_root() -> _Path:
+                home = _Path.home()
+                primary = home / "Obsidian" / "SecondBrain" / "5-CustomerKB"
+                legacy = home / "Obsidian" / "SecondBrain" / "5-5-CustomerKB"
+                if primary.exists():
+                    return primary
+                if legacy.exists():
+                    return legacy
+                return primary
+
+            async def _customer_autocomplete(interaction: discord.Interaction, current: str):
+                q = (current or "").strip().lower()
+                root = _customer_kb_root()
+                names: list[tuple[str, str]] = []
+                seen: set[str] = set()
+                registry_path = root / "_config" / "customer-registry.json"
+                try:
+                    if registry_path.exists():
+                        import json as _json
+                        data = _json.loads(registry_path.read_text(encoding="utf-8"))
+                        for rec in (data.get("customers") or {}).values():
+                            name = str(rec.get("name") or "").strip()
+                            if name:
+                                key = name.lower()
+                                if key not in seen:
+                                    seen.add(key)
+                                    status = str(rec.get("status") or "").strip()
+                                    label = f"{name} — {status}" if status else name
+                                    names.append((name, label))
+                except Exception:
+                    pass
+                customers_dir = root / "Customers"
+                if customers_dir.exists():
+                    for child in sorted(customers_dir.iterdir()):
+                        if child.is_dir():
+                            name = child.name.strip()
+                            key = name.lower()
+                            if key not in seen:
+                                seen.add(key)
+                                names.append((name, name))
+                choices = []
+                for name, label in names:
+                    if not q or q in name.lower():
+                        if len(label) > 100:
+                            label = label[:97] + "..."
+                        choices.append(discord.app_commands.Choice(name=label, value=name))
+                        if len(choices) >= 25:
+                            break
+                return choices
+
+            @tree.command(name="customer", description="Manage CustomerKB customer workspaces")
+            @discord.app_commands.describe(
+                name="Customer name or list filter",
+                command="Action to perform",
+                filter_text="Optional list filter keyword",
+            )
+            @discord.app_commands.autocomplete(name=_customer_autocomplete)
+            @discord.app_commands.choices(command=[
+                discord.app_commands.Choice(name="open — relink or reopen a customer thread", value="open"),
+                discord.app_commands.Choice(name="close — archive a customer thread", value="close"),
+                discord.app_commands.Choice(name="new — create a customer folder and thread", value="new"),
+                discord.app_commands.Choice(name="list — list customers", value="list"),
+            ])
+            async def slash_customer(
+                interaction: discord.Interaction,
+                name: str,
+                command: str,
+                filter_text: str = "",
+            ):
+                if not command:
+                    await interaction.response.send_message(
+                        "Usage: `/customer <name> <open|close|new|list> [filter]`",
+                        ephemeral=True,
+                    )
+                    return
+                import shlex as _shlex
+                safe_name = _shlex.quote(name)
+                safe_filter = _shlex.quote(filter_text) if filter_text else ""
+                payload = f'--name {safe_name} --action {command}'
+                if safe_filter:
+                    payload += f' --filter {safe_filter}'
+                ack = {
+                    "open": "Opening customer workspace~",
+                    "close": "Closing customer workspace~",
+                    "new": "Creating customer workspace~",
+                    "list": "Listing customers~",
+                }.get(command, "Working~")
+                await self._run_simple_slash(interaction, f"/customer {payload}", ack)
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash
@@ -3179,9 +3512,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # UX so users don't see commands they can't invoke. Off by default
         # to preserve the slash UX for deployments that intentionally allow
         # everyone in the guild.
-        if os.getenv("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in {
+        if os.getenv("DISCORD_HIDE_SLASH_COMMANDS", "false").strip().lower() in (
             "true", "1", "yes", "on",
-        }:
+        ):
             self._apply_owner_only_visibility(tree)
 
     def _apply_owner_only_visibility(self, tree) -> None:
@@ -3568,9 +3901,9 @@ class DiscordAdapter(BasePlatformAdapter):
         configured = self.config.extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.lower() not in {"false", "0", "no", "off"}
+                return configured.lower() not in ("false", "0", "no", "off")
             return bool(configured)
-        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
 
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs where no bot mention is required.
@@ -3594,153 +3927,6 @@ class DiscordAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
-
-    def _discord_thread_require_mention(self) -> bool:
-        """Return whether thread participation requires @mention to follow up.
-
-        When ``False`` (default), once the bot has participated in a thread it
-        keeps responding to every message in that thread without needing to be
-        mentioned again — useful for one-on-one conversations.
-
-        When ``True``, the @mention requirement is enforced inside threads as
-        well.  Set this when multiple bots share a thread and you want each
-        one to only fire on explicit @mention, avoiding bot-to-bot loops or
-        unwanted cross-replies.
-        """
-        configured = self.config.extra.get("thread_require_mention")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() not in ("false", "0", "no", "off")
-            return bool(configured)
-        return os.getenv("DISCORD_THREAD_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
-
-    def _discord_history_backfill(self) -> bool:
-        """Return whether history backfill is enabled for shared sessions."""
-        configured = self.config.extra.get("history_backfill")
-        if configured is not None:
-            if isinstance(configured, str):
-                return configured.lower() not in ("false", "0", "no", "off")
-            return bool(configured)
-        return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in ("true", "1", "yes")
-
-    def _discord_history_backfill_limit(self) -> int:
-        """Return the max number of messages to scan backwards for context.
-
-        In practice the scan usually stops much earlier — at the bot's own
-        last message in the channel (the natural partition point).  This
-        limit is a safety cap for cold starts and long gaps where no prior
-        bot message exists in recent history.
-        """
-        configured = self.config.extra.get("history_backfill_limit")
-        if configured is not None:
-            try:
-                return int(configured)
-            except (ValueError, TypeError):
-                pass
-        raw = os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
-        try:
-            return int(raw)
-        except (ValueError, TypeError):
-            return 50
-
-    async def _fetch_channel_context(
-        self,
-        channel: Any,
-        before: "DiscordMessage",
-    ) -> str:
-        """Fetch recent channel messages for conversational context.
-
-        Scans backwards from *before* and collects messages until it hits
-        a message sent by this bot (the natural partition point between
-        bot turns) or reaches ``history_backfill_limit``.
-
-        Returns a formatted block like::
-
-            [Recent channel messages]
-            [Alice] some message
-            [Bob [bot]] another message
-
-        Returns an empty string if no context is available.
-        """
-        limit = self._discord_history_backfill_limit()
-        if limit <= 0:
-            return ""
-
-        # Determine which bot messages to include in context
-        allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
-        include_other_bots = allow_bots_raw != "none"
-
-        # Use the in-memory cache to narrow the fetch window on hot paths.
-        # If we know our last message ID in this channel, pass it as `after`
-        # to avoid scanning the full limit.  Falls back to scanning on cache
-        # miss (cold start / restart).
-        # Guard: only use the cache when it's chronologically before the
-        # trigger — Discord snowflake IDs are monotonically increasing, so
-        # a simple int comparison suffices.
-        channel_id = str(getattr(channel, "id", ""))
-        _cached_id = self._last_self_message_id.get(channel_id)
-        _after_obj = None
-        try:
-            if _cached_id and int(_cached_id) < int(before.id):
-                _after_obj = discord.Object(id=int(_cached_id))
-        except (ValueError, TypeError):
-            pass  # Malformed cache entry — fall back to cold-start scan
-
-        try:
-            collected = []
-            # IMPORTANT: pass oldest_first=False explicitly.  discord.py 2.x
-            # silently flips the default to True when `after=` is supplied,
-            # which would select the *earliest* N messages after our last
-            # response instead of the *latest* N before the trigger.  In
-            # high-traffic windows that returns stale tool traces and drops
-            # the actual final answer.  See the regression test
-            # `test_fetch_channel_context_cache_uses_latest_window_when_after_set`.
-            async for msg in channel.history(
-                limit=limit,
-                before=before,
-                after=_after_obj,
-                oldest_first=False,
-            ):
-                # Stop at our own message — this is the partition point.
-                # Everything before this is already in the session transcript.
-                # (Redundant when _after_obj is set, but needed for cold start.)
-                if msg.author == self._client.user:
-                    break
-
-                # Skip system messages (pins, joins, thread renames, etc.)
-                if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
-                    continue
-
-                # Respect DISCORD_ALLOW_BOTS for other bots.
-                # For history context, "mentions" is treated as "all" — we are
-                # deciding what context to show, not whether to respond.
-                if getattr(msg.author, "bot", False) and not include_other_bots:
-                    continue
-
-                content = getattr(msg, "clean_content", msg.content) or ""
-                if not content and msg.attachments:
-                    content = "(attachment)"
-                if not content:
-                    continue
-
-                name = msg.author.display_name
-                if getattr(msg.author, "bot", False):
-                    name = f"{name} [bot]"
-                collected.append(f"[{name}] {content}")
-
-            if not collected:
-                return ""
-
-            # channel.history returns newest-first (oldest_first=False); reverse for chronological order
-            collected.reverse()
-            return "[Recent channel messages]\n" + "\n".join(collected)
-
-        except discord.Forbidden:
-            logger.debug("[%s] Missing permissions to fetch channel history", self.name)
-            return ""
-        except Exception as e:
-            logger.warning("[%s] Failed to fetch channel history: %s", self.name, e)
-            return ""
 
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
@@ -3880,84 +4066,6 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 return None
 
-    async def create_handoff_thread(
-        self,
-        parent_chat_id: str,
-        name: str,
-    ) -> Optional[str]:
-        """Create a Discord thread under a text channel for a handoff.
-
-        Falls back to a seed-message + ``message.create_thread`` path if
-        ``parent.create_thread`` is rejected (some channel types or
-        permission setups). Returns the new thread id as a string, or
-        ``None`` on failure or when the parent isn't a text channel
-        (DMs, voice channels, threads themselves can't host threads).
-        """
-        if not self._client or not DISCORD_AVAILABLE:
-            return None
-
-        try:
-            parent_id = int(parent_chat_id)
-        except (TypeError, ValueError):
-            return None
-
-        try:
-            parent = self._client.get_channel(parent_id)
-            if parent is None:
-                parent = await self._client.fetch_channel(parent_id)
-        except Exception as exc:
-            logger.warning(
-                "[%s] Handoff thread: cannot resolve parent %s: %s",
-                self.name, parent_chat_id, exc,
-            )
-            return None
-
-        # DMs, voice channels, and existing threads can't host child threads.
-        if isinstance(parent, getattr(discord, "DMChannel", ())):
-            logger.info(
-                "[%s] Handoff thread: parent %s is a DM; threads not supported here",
-                self.name, parent_chat_id,
-            )
-            return None
-
-        thread_name = (name or "handoff").strip()[:80] or "handoff"
-        reason = "Hermes session handoff"
-
-        # First try: create a thread directly on the channel.
-        try:
-            create = getattr(parent, "create_thread", None)
-            if create is not None:
-                thread = await create(
-                    name=thread_name,
-                    auto_archive_duration=1440,
-                    reason=reason,
-                )
-                return str(thread.id)
-        except Exception as direct_error:
-            logger.debug(
-                "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
-                self.name, direct_error,
-            )
-
-        # Fallback: post a seed message and create the thread from it.
-        try:
-            send = getattr(parent, "send", None)
-            if send is None:
-                return None
-            seed_msg = await send(f"\U0001f9f5 Hermes handoff: **{thread_name}**")
-            thread = await seed_msg.create_thread(
-                name=thread_name,
-                auto_archive_duration=1440,
-                reason=reason,
-            )
-            return str(thread.id)
-        except Exception as fallback_error:
-            logger.warning(
-                "[%s] Handoff thread: both create paths failed for parent %s: %s",
-                self.name, parent_chat_id, fallback_error,
-            )
-            return None
-
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -4040,84 +4148,6 @@ class DiscordAdapter(BasePlatformAdapter):
             msg = await channel.send(embed=embed, view=view)
             return SendResult(success=True, message_id=str(msg.id))
         except Exception as e:
-            return SendResult(success=False, error=str(e))
-
-    async def send_clarify(
-        self,
-        chat_id: str,
-        question: str,
-        choices: Optional[list],
-        clarify_id: str,
-        session_key: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Render a clarify prompt with one Discord button per choice.
-
-        Multi-choice mode (``choices`` non-empty): renders a button per option
-        plus a final "✏️ Other (type answer)" button. Picking "Other" flips
-        the clarify entry into text-capture mode so the next user message in
-        the session becomes the response. Numeric clicks resolve immediately
-        via ``resolve_gateway_clarify(clarify_id, choice_text)``.
-
-        Open-ended mode (``choices`` empty/None): renders the question as
-        plain embed text — no buttons. The gateway's text-intercept captures
-        the next message in this session and resolves the clarify.
-        """
-        if not self._client or not DISCORD_AVAILABLE:
-            return SendResult(success=False, error="Not connected")
-
-        try:
-            target_id = chat_id
-            if metadata and metadata.get("thread_id"):
-                target_id = metadata["thread_id"]
-
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
-
-            # Discord embed description limit is 4096; trim conservatively.
-            max_desc = 4088
-            body = str(question or "").strip()
-            if len(body) > max_desc:
-                body = body[: max_desc - 3] + "..."
-
-            embed = discord.Embed(
-                title="❓ Hermes needs your input",
-                description=body,
-                color=discord.Color.orange(),
-            )
-
-            clean_choices = [
-                str(c).strip() for c in (choices or []) if c is not None and str(c).strip()
-            ]
-            # Discord allows up to 5 buttons per row, 5 rows per view = 25.
-            # We reserve one slot for the "Other" button, so cap at 24 choices.
-            clean_choices = clean_choices[:24]
-
-            if clean_choices:
-                embed.add_field(
-                    name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
-                    inline=False,
-                )
-                view = ClarifyChoiceView(
-                    choices=clean_choices,
-                    clarify_id=clarify_id,
-                    allowed_user_ids=self._allowed_user_ids,
-                    allowed_role_ids=self._allowed_role_ids,
-                )
-            else:
-                embed.add_field(
-                    name="Reply",
-                    value="Reply in this channel with your answer.",
-                    inline=False,
-                )
-                view = None
-
-            msg = await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
-            return SendResult(success=True, message_id=str(msg.id))
-        except Exception as e:
-            logger.warning("[%s] send_clarify failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
     async def send_update_prompt(
@@ -4410,17 +4440,6 @@ class DiscordAdapter(BasePlatformAdapter):
         raw_content = message.content.strip()
         normalized_content = raw_content
         mention_prefix = False
-
-        snapshot_attachments = []
-        if hasattr(message, "message_snapshots") and message.message_snapshots:
-            snapshot_text_parts = []
-            for snap in message.message_snapshots:
-                if getattr(snap, "content", None):
-                    snapshot_text_parts.append(snap.content.strip())
-                snapshot_attachments.extend(getattr(snap, "attachments", []) or [])
-            if snapshot_text_parts and not raw_content:
-                raw_content = "\n".join(snapshot_text_parts)
-                normalized_content = raw_content
         if self._client.user and self._client.user in message.mentions:
             mention_prefix = True
             normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
@@ -4463,15 +4482,8 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             # Skip the mention check if the message is in a thread where
-            # the bot has previously participated (auto-created or replied in)
-            # — UNLESS thread_require_mention is enabled, in which case threads
-            # are gated the same as channels.  Useful when multiple bots share
-            # a thread.
-            in_bot_thread = (
-                is_thread
-                and thread_id in self._threads
-                and not self._discord_thread_require_mention()
-            )
+            # the bot has previously participated (auto-created or replied in).
+            in_bot_thread = is_thread and thread_id in self._threads
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if self._client.user not in message.mentions and not mention_prefix:
@@ -4484,8 +4496,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
-            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            skip_thread = bool(channel_ids & no_thread_channels)
+            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
@@ -4496,15 +4508,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
 
-        all_attachments = list(message.attachments) + snapshot_attachments
-
         # Determine message type
         msg_type = MessageType.TEXT
         if normalized_content.startswith("/"):
             msg_type = MessageType.COMMAND
-        elif all_attachments:
+        elif message.attachments:
             # Check attachment types
-            for att in all_attachments:
+            for att in message.attachments:
                 if att.content_type:
                     if att.content_type.startswith("image/"):
                         msg_type = MessageType.PHOTO
@@ -4563,13 +4573,13 @@ class DiscordAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         pending_text_injection: Optional[str] = None
-        for att in all_attachments:
+        for att in message.attachments:
             content_type = att.content_type or "unknown"
             if content_type.startswith("image/"):
                 try:
                     # Determine extension from content type (image/png -> .png)
                     ext = "." + content_type.split("/")[-1].split(";")[0]
-                    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                    if ext not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
                         ext = ".jpg"
                     cached_path = await self._cache_discord_image(att, ext)
                     media_urls.append(cached_path)
@@ -4583,7 +4593,7 @@ class DiscordAdapter(BasePlatformAdapter):
             elif content_type.startswith("audio/"):
                 try:
                     ext = "." + content_type.split("/")[-1].split(";")[0]
-                    if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
+                    if ext not in (".ogg", ".mp3", ".wav", ".webm", ".m4a"):
                         ext = ".ogg"
                     cached_path = await self._cache_discord_audio(att, ext)
                     media_urls.append(cached_path)
@@ -4626,7 +4636,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             logger.info("[Discord] Cached user document: %s", cached_path)
                             # Inject text content for plain-text documents (capped at 100 KB)
                             MAX_TEXT_INJECT_BYTES = 100 * 1024
-                            if ext in {".md", ".txt", ".log"} and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                            if ext in (".md", ".txt", ".log") and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
                                 try:
                                     text_content = raw_bytes.decode("utf-8")
                                     display_name = att.filename or f"document{ext}"
@@ -4650,50 +4660,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if pending_text_injection:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
 
-        # ── History backfill ─────────────────────────────────────────
-        # When require_mention is active, the bot only processes messages
-        # that @mention it.  Messages in the channel between bot turns are
-        # invisible to the session transcript.  To recover that context,
-        # fetch recent channel history and prepend it to the user message.
-        #
-        # The fetch window is: everything after the bot's last message in
-        # the channel up to (but not including) the current trigger.  On
-        # cold start (no prior bot message found), fetch the last N messages
-        # and stop at the first self-message encountered.
-        #
-        # Threads naturally scope to thread-only history (channel.history()
-        # on a thread returns only that thread's messages).  DMs are skipped
-        # because every DM message triggers the bot — there's no mention gap
-        # to fill; the session transcript already has everything.
-        #
-        # Per-user sessions also benefit: Alice's session is missing the
-        # other-channel-participants' context, and her own messages from
-        # before she mentioned the bot.  Backfill fills that gap.
-        #
-        # Messages that arrive while the bot is processing (between trigger
-        # and response) are not captured — this is an accepted simplification
-        # to keep the partition rule clean.
-        _channel_context = None
-        _is_dm = isinstance(message.channel, discord.DMChannel)
-        if not _is_dm:
-            _needed_mention = (
-                require_mention
-                and not is_free_channel
-                and not in_bot_thread
-            )
-            _backfill_enabled = self._discord_history_backfill()
-            if _needed_mention and _backfill_enabled:
-                _backfill_text = await self._fetch_channel_context(
-                    message.channel, before=message,
-                )
-                if _backfill_text:
-                    _channel_context = _backfill_text
-
         # Defense-in-depth: prevent empty user messages from entering session
-        # (can happen when user sends @mention-only with no other text).
-        # When channel_context is present, a bare mention means "catch me up"
-        # — the context IS the message, so skip the placeholder.
-        if (not event_text or not event_text.strip()) and not _channel_context:
+        # (can happen when user sends @mention-only with no other text)
+        if not event_text or not event_text.strip():
             event_text = "(The user sent a message with no text content)"
 
         _chan = message.channel
@@ -4722,7 +4691,6 @@ class DiscordAdapter(BasePlatformAdapter):
             timestamp=message.created_at,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
-            channel_context=_channel_context,
         )
 
         # Track thread participation so the bot won't require @mention for
@@ -5404,188 +5372,3 @@ if DISCORD_AVAILABLE:
         async def on_timeout(self):
             self.resolved = True
             self.clear_items()
-
-
-    class ClarifyChoiceView(discord.ui.View):
-        """Interactive button view for the clarify tool's multiple-choice prompts.
-
-        Renders one button per choice (max 24) plus a final ``✏️ Other`` button.
-        Picking a numeric choice resolves the gateway clarify entry immediately;
-        picking ``Other`` flips the entry into text-capture mode so the next
-        user message in the session becomes the response (the gateway's
-        text-intercept handles the resolution).
-
-        Auth gating mirrors ``ExecApprovalView`` — only users/roles in the
-        Discord adapter's allowlist may answer. Single-use: after the first
-        valid click all buttons disable and the embed updates to show who
-        answered and what they chose.
-        """
-
-        def __init__(
-            self,
-            choices: List[str],
-            clarify_id: str,
-            allowed_user_ids: set,
-            allowed_role_ids: Optional[set] = None,
-        ):
-            super().__init__(timeout=300)  # 5-minute timeout
-            self.choices = list(choices)[:24]
-            self.clarify_id = clarify_id
-            self.allowed_user_ids = allowed_user_ids
-            self.allowed_role_ids = allowed_role_ids or set()
-            self.resolved = False
-
-            for index, choice in enumerate(self.choices):
-                # Discord button labels are capped at 80 chars.
-                label_body = choice if len(choice) <= 75 else choice[:72] + "..."
-                button = discord.ui.Button(
-                    label=f"{index + 1}. {label_body}",
-                    style=discord.ButtonStyle.primary,
-                    custom_id=f"clarify:{clarify_id}:{index}",
-                )
-                button.callback = self._make_choice_callback(index, choice)
-                self.add_item(button)
-
-            other_btn = discord.ui.Button(
-                label="✏️ Other (type answer)",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"clarify:{clarify_id}:other",
-            )
-            other_btn.callback = self._on_other
-            self.add_item(other_btn)
-
-        def _check_auth(self, interaction: "discord.Interaction") -> bool:
-            return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
-            )
-
-        def _make_choice_callback(self, index: int, choice: str):
-            async def _callback(interaction: "discord.Interaction"):
-                await self._resolve_choice(interaction, index, choice)
-            return _callback
-
-        async def _resolve_choice(
-            self,
-            interaction: "discord.Interaction",
-            index: int,
-            choice: str,
-        ) -> None:
-            """Resolve the clarify with a chosen option."""
-            if self.resolved:
-                await interaction.response.send_message(
-                    "This prompt has already been answered~", ephemeral=True,
-                )
-                return
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(
-                    "You're not authorized to answer this prompt~", ephemeral=True,
-                )
-                return
-
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-
-            embed = interaction.message.embeds[0] if (
-                interaction.message and interaction.message.embeds
-            ) else None
-            if embed:
-                user = getattr(interaction, "user", None)
-                display_name = getattr(user, "display_name", "user")
-                embed.color = discord.Color.green()
-                embed.set_footer(text=f"Answered by {display_name}: {choice}")
-
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                logger.debug(
-                    "Discord clarify edit_message failed for %s",
-                    self.clarify_id,
-                    exc_info=True,
-                )
-                try:
-                    await interaction.response.defer()
-                except Exception:
-                    pass
-
-            # Resolve via the gateway clarify primitive — same mechanism as
-            # Telegram. Look up the canonical choice text from the entry so
-            # we round-trip the original value, not a button-label variant.
-            resolved_text: Optional[str] = None
-            try:
-                from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
-                entry = _clarify_entries.get(self.clarify_id)
-                if entry and entry.choices and 0 <= index < len(entry.choices):
-                    resolved_text = entry.choices[index]
-            except Exception:
-                resolved_text = None
-            if resolved_text is None:
-                resolved_text = choice
-
-            try:
-                from tools.clarify_gateway import resolve_gateway_clarify
-                resolved = resolve_gateway_clarify(self.clarify_id, resolved_text)
-                logger.info(
-                    "Discord clarify button resolved (id=%s, choice=%r, user=%s, ok=%s)",
-                    self.clarify_id, resolved_text,
-                    getattr(getattr(interaction, "user", None), "display_name", "?"),
-                    resolved,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Discord clarify resolve_gateway_clarify failed (id=%s): %s",
-                    self.clarify_id, exc,
-                )
-
-        async def _on_other(self, interaction: "discord.Interaction") -> None:
-            """Flip the clarify entry into text-capture mode."""
-            if self.resolved:
-                await interaction.response.send_message(
-                    "This prompt has already been answered~", ephemeral=True,
-                )
-                return
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(
-                    "You're not authorized to answer this prompt~", ephemeral=True,
-                )
-                return
-
-            # Don't pop the entry — the gateway's text-intercept needs it
-            # until the user actually types. Just mark it as awaiting text
-            # and disable the buttons so the user can't double-click.
-            try:
-                from tools.clarify_gateway import mark_awaiting_text
-                mark_awaiting_text(self.clarify_id)
-            except Exception as exc:
-                logger.warning(
-                    "Discord clarify mark_awaiting_text failed (id=%s): %s",
-                    self.clarify_id, exc,
-                )
-
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-
-            embed = interaction.message.embeds[0] if (
-                interaction.message and interaction.message.embeds
-            ) else None
-            if embed:
-                user = getattr(interaction, "user", None)
-                display_name = getattr(user, "display_name", "user")
-                embed.color = discord.Color.blue()
-                embed.set_footer(
-                    text=f"Awaiting typed response from {display_name}…",
-                )
-
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                try:
-                    await interaction.response.defer()
-                except Exception:
-                    pass
-
-        async def on_timeout(self):
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True

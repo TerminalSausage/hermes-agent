@@ -6680,6 +6680,9 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            # Substitute {args} placeholder with user-provided arguments
+                            user_args = event.get_command_args().strip() if hasattr(event, "get_command_args") else ""
+                            exec_cmd = exec_cmd.replace("{args}", user_args)
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
