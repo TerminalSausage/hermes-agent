@@ -3392,6 +3392,20 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
         finally:
+            # ── Pepper local patch: stop typing BEFORE post-delivery callback ──
+            # Upstream bug #24971: if the callback hangs (e.g. dead socket in
+            # CLOSE-WAIT), _stop_typing_task() was never reached and the typing
+            # indicator ran indefinitely.  PRs #24983 / #25003 fix this upstream
+            # (open as of 2026-05-16).  Revert this block when either merges.
+            # Stop typing indicator FIRST so a hung callback can't block cleanup.
+            await _stop_typing_task()
+            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
+            # that may have been recreated by _keep_typing after the last stop_typing()
+            try:
+                if hasattr(self, "stop_typing"):
+                    await self.stop_typing(event.source.chat_id)
+            except Exception:
+                pass
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #
@@ -3419,18 +3433,9 @@ class BasePlatformAdapter(ABC):
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
-                        await _post_result
-                except Exception:
+                        await asyncio.wait_for(_post_result, timeout=30.0)
+                except (asyncio.TimeoutError, Exception):
                     pass
-            # Stop typing indicator
-            await _stop_typing_task()
-            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
-            # that may have been recreated by _keep_typing after the last stop_typing()
-            try:
-                if hasattr(self, "stop_typing"):
-                    await self.stop_typing(event.source.chat_id)
-            except Exception:
-                pass
             # Late-arrival drain: a message may have arrived during the
             # cleanup awaits above (typing_task cancel, stop_typing).  Such
             # messages passed the Level-1 guard (entry still live, Event
