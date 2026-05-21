@@ -2971,17 +2971,23 @@ class DiscordAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
+        _typing_logger = logging.getLogger("gateway.run")
+        _typing_logger.info("[typing] Discord send_typing: starting _typing_loop for chat_id=%s", chat_id)
         self._typing_tasks[chat_id] = asyncio.create_task(_typing_loop())
 
     async def stop_typing(self, chat_id: str) -> None:
         """Stop the persistent typing indicator for a channel."""
+        _typing_logger = logging.getLogger("gateway.run")
         task = self._typing_tasks.pop(chat_id, None)
         if task:
+            _typing_logger.info("[typing] Discord stop_typing: cancelling _typing_loop for chat_id=%s (task_done=%s)", chat_id, task.done())
             task.cancel()
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        else:
+            _typing_logger.info("[typing] Discord stop_typing: NO _typing_loop found for chat_id=%s (keys=%s)", chat_id, list(self._typing_tasks.keys()))
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Discord channel."""
