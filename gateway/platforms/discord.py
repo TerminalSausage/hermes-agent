@@ -3317,8 +3317,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if get_active_profile_name().lower() == "ada":
             def _customer_kb_root() -> _Path:
                 home = _Path.home()
-                primary = home / "Obsidian" / "SecondBrain" / "5-CustomerKB"
-                legacy = home / "Obsidian" / "SecondBrain" / "5-5-CustomerKB"
+                primary = home / "vault" / "5-CustomerKB"
+                legacy = home / "Obsidian" / "SecondBrain" / "5-CustomerKB"
                 if primary.exists():
                     return primary
                 if legacy.exists():
