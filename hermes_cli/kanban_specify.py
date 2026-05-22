@@ -150,8 +150,11 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
-    with kb.connect() as conn:
+    conn = kb.connect()
+    try:
         task = kb.get_task(conn, task_id)
+    finally:
+        conn.close()
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
@@ -239,7 +242,8 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
-    with kb.connect() as conn:
+    conn = kb.connect()
+    try:
         ok = kb.specify_triage_task(
             conn,
             task_id,
@@ -247,6 +251,8 @@ def specify_task(
             body=new_body,
             author=author or _profile_author(),
         )
+    finally:
+        conn.close()
     if not ok:
         # Race: someone else promoted / archived the task between our
         # read above and the write. Report, don't crash.
@@ -261,11 +267,14 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
-    with kb.connect() as conn:
+    conn = kb.connect()
+    try:
         tasks = kb.list_tasks(
             conn,
             status="triage",
             tenant=tenant,
             include_archived=False,
         )
+    finally:
+        conn.close()
     return [t.id for t in tasks]

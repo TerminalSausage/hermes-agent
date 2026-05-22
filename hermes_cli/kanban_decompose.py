@@ -281,8 +281,11 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
-    with kb.connect() as conn:
+    conn = kb.connect()
+    try:
         task = kb.get_task(conn, task_id)
+    finally:
+        conn.close()
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
@@ -370,7 +373,8 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect() as conn:
+        conn = kb.connect()
+        try:
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
@@ -379,6 +383,8 @@ def decompose_task(
                 assignee=assignee_val,
                 author=audit_author,
             )
+        finally:
+            conn.close()
         if not ok:
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
@@ -439,7 +445,8 @@ def decompose_task(
         })
 
     try:
-        with kb.connect() as conn:
+        conn = kb.connect()
+        try:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -448,6 +455,8 @@ def decompose_task(
                 author=audit_author,
                 auto_promote=auto_promote,
             )
+        finally:
+            conn.close()
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
@@ -467,11 +476,14 @@ def decompose_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
-    with kb.connect() as conn:
+    conn = kb.connect()
+    try:
         rows = kb.list_tasks(
             conn,
             status="triage",
             tenant=tenant,
             limit=1000,
         )
+    finally:
+        conn.close()
     return [row.id for row in rows]
