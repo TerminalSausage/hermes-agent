@@ -89,6 +89,7 @@ def test_plugin_engine_update_model_args():
     assert kw["context_length"] == 131_072
     assert "model" in kw
     assert "provider" in kw
+<<<<<<< HEAD
     # Should NOT pass api_mode — the ABC doesn't accept it
     assert "api_mode" not in kw
 
@@ -137,3 +138,6 @@ def test_plugin_engine_gets_gateway_conversation_id_on_session_start():
     kw = engine.on_session_start.call_args.kwargs
     assert kw["conversation_id"] == gateway_session_key
     assert kw["platform"] == "telegram"
+=======
+    assert "api_mode" in kw
+>>>>>>> main

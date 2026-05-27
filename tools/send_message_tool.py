@@ -139,6 +139,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
+<<<<<<< HEAD
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
             },
             "components": {
@@ -186,6 +187,9 @@ SEND_MESSAGE_SCHEMA = {
                         }
                     }
                 }
+=======
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> for a file under a Hermes media cache or HERMES_MEDIA_ALLOW_DIRS — the platform will deliver it as a native media attachment."
+>>>>>>> main
             }
         },
         "required": []
@@ -298,6 +302,7 @@ def _handle_send(args):
     force_document_attachments = "[[as_document]]" in message
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
@@ -638,7 +643,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     """
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
-    from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
 
     # Telegram adapter import is optional (requires python-telegram-bot)
@@ -664,10 +668,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         except Exception:
             logger.debug("Failed to apply Slack mrkdwn formatting in _send_to_platform", exc_info=True)
 
-    # Platform message length limits (from adapter class attributes)
+    # Platform message length limits (from adapter class attributes for
+    # built-in platforms; from PlatformEntry.max_message_length for plugins).
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
-        Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
     if _feishu_available:
@@ -717,18 +721,31 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
-    # --- Discord: special handling for media attachments ---
+    # --- Discord: chunked delivery via the registry's standalone_sender_fn.
+    # The plugin's ``_standalone_send`` (registered in
+    # plugins/platforms/discord/adapter.py) handles forum channels, threads,
+    # and multipart media uploads.  ``_send_via_adapter`` tries the live
+    # in-process adapter first via ``adapter.send()``, but Discord's elif
+    # historically went straight to the HTTP path; we preserve that by
+    # explicitly invoking the registry hook here so behavior is unchanged.
     if platform == Platform.DISCORD:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get("discord")
+        if entry is None or entry.standalone_sender_fn is None:
+            return {"error": "Discord plugin not registered or missing standalone_sender_fn"}
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _send_discord(
-                pconfig.token,
+            result = await entry.standalone_sender_fn(
+                pconfig,
                 chat_id,
                 chunk,
-                media_files=media_files if is_last else [],
                 thread_id=thread_id,
+<<<<<<< HEAD
                 components=components if is_last else None,
+=======
+                media_files=media_files if is_last else [],
+>>>>>>> main
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -828,8 +845,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_email(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SMS:
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
-        elif platform == Platform.MATTERMOST:
-            result = await _send_mattermost(pconfig.token, pconfig.extra, chat_id, chunk)
         elif platform == Platform.MATRIX:
             result = await _send_matrix(pconfig.token, pconfig.extra, chat_id, chunk)
         elif platform == Platform.HOMEASSISTANT:
@@ -1109,6 +1124,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
+<<<<<<< HEAD
 def _derive_forum_thread_name(message: str) -> str:
     """Derive a thread name from the first line of the message, capped at 100 chars."""
     first_line = message.strip().split("\n", 1)[0].strip()
@@ -1451,6 +1467,8 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         return _error(f"Discord send failed: {e}")
 
 
+=======
+>>>>>>> main
 async def _send_slack(token, chat_id, message):
     """Send via Slack Web API."""
     try:
@@ -1771,30 +1789,6 @@ async def _send_sms(auth_token, chat_id, message):
                 return {"success": True, "platform": "sms", "chat_id": chat_id, "message_id": msg_sid}
     except Exception as e:
         return _error(f"SMS send failed: {e}")
-
-
-async def _send_mattermost(token, extra, chat_id, message):
-    """Send via Mattermost REST API."""
-    try:
-        import aiohttp
-    except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
-    try:
-        base_url = (extra.get("url") or os.getenv("MATTERMOST_URL", "")).rstrip("/")
-        token = token or os.getenv("MATTERMOST_TOKEN", "")
-        if not base_url or not token:
-            return {"error": "Mattermost not configured (MATTERMOST_URL, MATTERMOST_TOKEN required)"}
-        url = f"{base_url}/api/v4/posts"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.post(url, headers=headers, json={"channel_id": chat_id, "message": message}) as resp:
-                if resp.status not in {200, 201}:
-                    body = await resp.text()
-                    return _error(f"Mattermost API error ({resp.status}): {body}")
-                data = await resp.json()
-        return {"success": True, "platform": "mattermost", "chat_id": chat_id, "message_id": data.get("id")}
-    except Exception as e:
-        return _error(f"Mattermost send failed: {e}")
 
 
 async def _send_matrix(token, extra, chat_id, message):
