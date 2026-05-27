@@ -130,6 +130,7 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
                 "type": "channel",
             })
         # Forum channels (type 15) — creating a message auto-spawns a thread post.
+        # NachoTek patch: discord.py 2.7+ uses "forums" not "forum_channels"
         forums = getattr(guild, "forums", None) or []
         for ch in forums:
             channels.append({

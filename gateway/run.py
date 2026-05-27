@@ -7643,6 +7643,9 @@ class GatewayRunner:
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # NachoTek patch: {args} substitution for exec quick commands
+                        user_args = event.get_command_args().strip() if hasattr(event, "get_command_args") else ""
+                        exec_cmd = exec_cmd.replace("{args}", user_args)
                         try:
                             # Substitute {args} placeholder with user-provided arguments
                             user_args = event.get_command_args().strip() if hasattr(event, "get_command_args") else ""

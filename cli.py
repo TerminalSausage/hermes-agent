@@ -7033,6 +7033,9 @@ class HermesCLI:
                     import shlex
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # NachoTek patch: {args} substitution for exec quick commands
+                        user_args = cmd_original[len(base_cmd):].strip()
+                        exec_cmd = exec_cmd.replace("{args}", user_args)
                         try:
                             user_args = cmd_original[len(base_cmd):].strip()
                             exec_cmd = exec_cmd.replace("{args}", shlex.quote(user_args))
