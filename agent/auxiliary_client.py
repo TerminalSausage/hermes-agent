@@ -155,9 +155,6 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
-    "gemini-acp": "copilot-acp",  # routes through same external_process path
-    "gemini-cli-acp": "copilot-acp",
-    "google-gemini-acp": "copilot-acp",
     "tencent": "tencent-tokenhub",
     "tokenhub": "tencent-tokenhub",
     "tencent-cloud": "tencent-tokenhub",
@@ -3681,7 +3678,7 @@ def resolve_provider_client(
             or _read_main_model(),
             provider,
         )
-        if provider == "copilot-acp":
+        if provider in ("copilot-acp", "gemini-acp"):
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
