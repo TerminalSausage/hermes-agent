@@ -697,20 +697,12 @@ class _CodexCompletionsAdapter:
             # xAI's Responses endpoint rejects ``pattern`` and ``format`` JSON Schema
             # keywords (HTTP 400). Strip them here to match the parity guarantee that
             # chat_completion_helpers.py provides for the main-agent xAI path.
-            #
-            # Deep-copy before sanitizing — ``list(tools)`` is only a shallow
-            # copy of the outer list, but the sanitizers mutate the inner
-            # parameter dicts in place.  Without a deep copy the caller's
-            # tool registry permanently loses its slash-containing enum
-            # constraints after the first auxiliary xAI call.  See #27907.
             try:
-                import copy as _copy
                 from tools.schema_sanitizer import (
                     strip_pattern_and_format,
                     strip_slash_enum,
                 )
-                tools = _copy.deepcopy(list(tools))
-                tools, _ = strip_pattern_and_format(tools)
+                tools, _ = strip_pattern_and_format(list(tools))
                 tools, _ = strip_slash_enum(tools)
             except Exception as exc:
                 logger.warning(
@@ -833,7 +825,7 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in (getattr(final, "output", None) or []):
+            for item in getattr(final, "output", []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
@@ -1240,23 +1232,8 @@ def _read_nous_auth() -> Optional[dict]:
 
 
 def _nous_api_key(provider: dict) -> str:
-    """Extract a usable Nous inference JWT from stored auth state."""
-    from hermes_cli.auth import _nous_invoke_jwt_is_usable
-
-    for token_key, expiry_key in (
-        ("agent_key", "agent_key_expires_at"),
-        ("access_token", "expires_at"),
-    ):
-        token = provider.get(token_key)
-        if not isinstance(token, str) or not token.strip():
-            continue
-        if _nous_invoke_jwt_is_usable(
-            token,
-            scope=provider.get("scope"),
-            expires_at=provider.get(expiry_key),
-        ):
-            return token
-    return ""
+    """Extract the Nous runtime credential from the compatibility field."""
+    return provider.get("agent_key") or provider.get("access_token", "")
 
 
 def _nous_base_url() -> str:
@@ -1268,16 +1245,25 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
     """Return fresh Nous runtime credentials when available.
 
     This mirrors the main agent's 401 recovery path and keeps auxiliary
-    clients aligned with the singleton auth store + JWT refresh flow instead of
+    clients aligned with the singleton auth store + JWT/mint flow instead of
     relying only on whatever raw tokens happen to be sitting in auth.json
     or the credential pool.
     """
     try:
-        from hermes_cli.auth import resolve_nous_runtime_credentials
+        from hermes_cli.auth import (
+            NOUS_INFERENCE_AUTH_MODE_AUTO,
+            NOUS_INFERENCE_AUTH_MODE_LEGACY,
+            resolve_nous_runtime_credentials,
+        )
 
         creds = resolve_nous_runtime_credentials(
+            min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
             timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-            force_refresh=force_refresh,
+            inference_auth_mode=(
+                NOUS_INFERENCE_AUTH_MODE_LEGACY
+                if force_refresh
+                else NOUS_INFERENCE_AUTH_MODE_AUTO
+            ),
         )
     except Exception as exc:
         logger.debug("Auxiliary Nous runtime credential resolution failed: %s", exc)
@@ -1561,9 +1547,13 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         _mark_provider_unhealthy("nous", ttl=60)
         return None, None
     if runtime is None and nous:
+        # Runtime credential mint failed but stored Nous auth is still present.
+        # Falls back to the raw stored token below; surface a debug line so
+        # operators investigating expired/invalid sessions have a breadcrumb,
+        # without blocking the fallback path the rest of this function relies on.
         logger.debug(
-            "Auxiliary Nous: runtime JWT refresh failed; checking stored "
-            "auth.json token."
+            "Auxiliary Nous: runtime credential mint failed; falling back to "
+            "stored auth.json token."
         )
     global auxiliary_is_nous
     auxiliary_is_nous = True
@@ -1601,13 +1591,6 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         api_key, base_url = runtime
     else:
         api_key = _nous_api_key(nous or {})
-        if not api_key:
-            logger.warning(
-                "Auxiliary Nous client unavailable: no usable inference JWT found "
-                "(run: hermes auth add nous)."
-            )
-            _mark_provider_unhealthy("nous", ttl=60)
-            return None, None
         base_url = str((nous or {}).get("inference_base_url") or _nous_base_url()).rstrip("/")
     return (
         OpenAI(
@@ -1616,47 +1599,6 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         ),
         model,
     )
-
-
-def _refresh_nous_recommended_model(
-    *, vision: bool, stale_model: Optional[str]
-) -> Optional[str]:
-    """Re-fetch the Nous Portal's recommended model after a stale-model 404.
-
-    Long-lived processes (gateway, watchers) cache the Portal's
-    ``recommended-models`` payload for 10 minutes and, in practice, can pin a
-    model for the whole process lifetime. When that model is later dropped from
-    the Nous → OpenRouter catalog, every auxiliary call 404s with
-    "model does not exist". This forces a fresh Portal fetch and returns a
-    model name to retry with:
-
-      * the Portal's current recommendation for the task, if it differs from
-        the model that just failed; otherwise
-      * ``_NOUS_MODEL`` (google/gemini-3-flash-preview), the known-good default,
-        if it too differs from the failed model.
-
-    Returns ``None`` when no usable alternative is available (e.g. the Portal
-    still recommends the exact model that just 404'd and the default also
-    matches it) — callers should then let the original error propagate.
-    """
-    stale = (stale_model or "").strip().lower()
-    fresh: Optional[str] = None
-    try:
-        from hermes_cli.models import get_nous_recommended_aux_model
-
-        fresh = get_nous_recommended_aux_model(vision=vision, force_refresh=True)
-    except Exception as exc:
-        logger.debug(
-            "Nous recommended-model refresh failed (%s); using default %s",
-            exc, _NOUS_MODEL,
-        )
-    if fresh and fresh.strip().lower() != stale:
-        return fresh
-    # Portal recommendation unchanged or unavailable — fall back to the
-    # hardcoded known-good default, but only if it's actually different.
-    if _NOUS_MODEL.strip().lower() != stale:
-        return _NOUS_MODEL
-    return None
 
 
 def _read_main_model() -> str:
@@ -1718,48 +1660,26 @@ def _read_main_provider() -> str:
 # per turn — no lock needed. Cleared by ``clear_runtime_main()``.
 _RUNTIME_MAIN_PROVIDER: str = ""
 _RUNTIME_MAIN_MODEL: str = ""
-_RUNTIME_MAIN_BASE_URL: str = ""
-_RUNTIME_MAIN_API_KEY: str = ""
-_RUNTIME_MAIN_API_MODE: str = ""
 
 
-def set_runtime_main(
-    provider: str,
-    model: str,
-    *,
-    base_url: str = "",
-    api_key: str = "",
-    api_mode: str = "",
-) -> None:
-    """Record the live runtime provider/model/credentials for the current AIAgent.
+def set_runtime_main(provider: str, model: str) -> None:
+    """Record the live runtime provider/model for the current AIAgent.
 
     Called by ``run_agent.AIAgent._sync_runtime_main_for_aux_routing`` (or
     equivalent setter) at the top of each turn so that
     ``_read_main_provider`` / ``_read_main_model`` reflect CLI/gateway
     overrides instead of the stale config.yaml default.
-
-    For ``custom:`` providers, ``base_url`` and ``api_key`` must also be
-    recorded so that ``_resolve_auto`` can construct a valid client in
-    Step 1 instead of falling through to the aggregator chain.
     """
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
     _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
     _RUNTIME_MAIN_MODEL = (model or "").strip()
-    _RUNTIME_MAIN_BASE_URL = (base_url or "").strip()
-    _RUNTIME_MAIN_API_KEY = api_key.strip() if isinstance(api_key, str) else ""
-    _RUNTIME_MAIN_API_MODE = (api_mode or "").strip()
 
 
 def clear_runtime_main() -> None:
     """Clear the runtime override (e.g. on session end)."""
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
     _RUNTIME_MAIN_PROVIDER = ""
     _RUNTIME_MAIN_MODEL = ""
-    _RUNTIME_MAIN_BASE_URL = ""
-    _RUNTIME_MAIN_API_KEY = ""
-    _RUNTIME_MAIN_API_MODE = ""
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -2321,15 +2241,11 @@ def _is_payment_error(exc: Exception) -> bool:
     # but sometimes wrap them in 429 or other codes.
     # Daily quota exhaustion from Bedrock, Vertex AI, and similar providers
     # uses different language but is semantically identical to credit exhaustion.
-    if status in {402, 404, 429, None}:
+    if status in {402, 429, None}:
         if any(kw in err_lower for kw in (
             "credits", "insufficient funds",
             "can only afford", "billing",
             "payment required",
-            "out of funds", "run out of funds",
-            "balance_depleted", "no usable credits",
-            "model_not_supported_on_free_tier",
-            "not available on the free tier",
             # Daily / monthly / weekly quota exhaustion keywords
             "quota exceeded", "quota_exceeded",
             "too many tokens per day", "daily limit",
@@ -2339,18 +2255,6 @@ def _is_payment_error(exc: Exception) -> bool:
         )):
             return True
     return False
-
-
-def _nous_portal_account_has_fresh_paid_access() -> bool:
-    """Return True only when the fresh Nous account API says paid access is allowed."""
-    try:
-        from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        return account_info.paid_service_access is True
-    except Exception as exc:
-        logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
-        return False
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -2381,10 +2285,6 @@ def _is_rate_limit_error(exc: Exception) -> bool:
         if not any(kw in err_lower for kw in (
             "credits", "insufficient funds", "billing",
             "payment required", "can only afford",
-            "out of funds", "run out of funds",
-            "balance_depleted", "no usable credits",
-            "model_not_supported_on_free_tier",
-            "not available on the free tier",
         )):
             return True
     return False
@@ -2434,16 +2334,7 @@ def _is_auth_error(exc: Exception) -> bool:
     if status == 401:
         return True
     err_lower = str(exc).lower()
-    if "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower():
-        return True
-    # xAI returns HTTP 403 with "unauthenticated:bad-credentials" when an OAuth2
-    # access token has expired or is invalid — semantically a 401 auth failure,
-    # even though the status code is 403 (PermissionDenied).
-    if status == 403 and "bad-credentials" in err_lower:
-        return True
-    if "unauthenticated" in err_lower and "bad-credentials" in err_lower:
-        return True
-    return False
+    return "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower()
 
 
 def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
@@ -2487,46 +2378,6 @@ def _is_unsupported_temperature_error(exc: Exception) -> bool:
     public symbol because existing tests and call sites import it by name.
     """
     return _is_unsupported_parameter_error(exc, "temperature")
-
-
-def _is_model_not_found_error(exc: Exception) -> bool:
-    """Detect "the requested model doesn't exist" errors (404 / invalid model).
-
-    This fires when a resolved model name is no longer served by the endpoint
-    — most commonly when a long-lived process pinned a Portal-recommended model
-    that has since been dropped from the Nous → OpenRouter catalog. The Nous
-    proxy returns 404 with a body like::
-
-        Model 'gpt-5.4-mini' not found. The requested model does not exist
-        in our configuration or OpenRouter catalog.
-
-    Distinct from :func:`_is_payment_error` (which also matches some 404s for
-    free-tier/credit language) — this one keys on "does not exist / not found /
-    not a valid model" phrasing, and explicitly excludes the billing keywords
-    that the payment path already owns so the two predicates don't overlap.
-    """
-    status = getattr(exc, "status_code", None)
-    err_lower = str(exc).lower()
-    # Billing/quota 404s belong to _is_payment_error — don't claim them here.
-    if any(kw in err_lower for kw in (
-        "credits", "insufficient funds", "billing", "out of funds",
-        "balance_depleted", "no usable credits", "free tier", "free-tier",
-        "not available on the free tier",
-    )):
-        return False
-    if status not in {404, 400, None}:
-        return False
-    return any(kw in err_lower for kw in (
-        "model does not exist",
-        "does not exist in our configuration",
-        "openrouter catalog",
-        "is not a valid model",
-        "no such model",
-        "model not found",
-        "the model `",            # OpenAI-style: "The model `X` does not exist"
-        "model_not_found",
-        "unknown model",
-    ))
 
 
 def _evict_cached_clients(provider: str) -> None:
@@ -2636,8 +2487,6 @@ def _recoverable_pool_provider(
         return "copilot"
     if base_url_host_matches(base, "api.kimi.com"):
         return "kimi-coding"
-    if base_url_host_matches(base, "api.x.ai"):
-        return "xai-oauth"
     # For api_key providers not in the hardcoded list (e.g. opencode-go), match
     # the client base URL against all registered api_key providers so that
     # credential-pool rotation works for any provider the user configured.
@@ -2834,11 +2683,15 @@ def _refresh_provider_credentials(provider: str) -> bool:
             _evict_cached_clients(normalized)
             return True
         if normalized == "nous":
-            from hermes_cli.auth import resolve_nous_runtime_credentials
+            from hermes_cli.auth import (
+                NOUS_INFERENCE_AUTH_MODE_LEGACY,
+                resolve_nous_runtime_credentials,
+            )
 
             creds = resolve_nous_runtime_credentials(
+                min_key_ttl_seconds=max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))),
                 timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-                force_refresh=True,
+                inference_auth_mode=NOUS_INFERENCE_AUTH_MODE_LEGACY,
             )
             if not str(creds.get("api_key", "") or "").strip():
                 return False
@@ -2852,24 +2705,6 @@ def _refresh_provider_credentials(provider: str) -> bool:
             if not str(token or "").strip():
                 token = resolve_anthropic_token()
             if not str(token or "").strip():
-                return False
-            _evict_cached_clients(normalized)
-            return True
-        if normalized == "xai-oauth":
-            # Preference: pool-level refresh (uses refresh_token from pool entry),
-            # then fall back to singleton auth-store resolver.
-            pool = load_pool(normalized)
-            if pool and pool.has_credentials():
-                # Ensure a current entry is selected before trying to refresh.
-                pool.select()
-                refreshed = pool.try_refresh_current()
-                if refreshed is not None and str(getattr(refreshed, "runtime_api_key", "") or "").strip():
-                    _evict_cached_clients(normalized)
-                    return True
-            from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-
-            creds = resolve_xai_oauth_runtime_credentials(force_refresh=True)
-            if not str(creds.get("api_key", "") or "").strip():
                 return False
             _evict_cached_clients(normalized)
             return True
@@ -3080,18 +2915,6 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
 
-    # Fall back to process-local globals when main_runtime dict was not
-    # provided or was incomplete.  ``set_runtime_main()`` now records
-    # base_url/api_key/api_mode alongside provider/model, so custom:
-    # providers get the full credential surface in Step 1 of the
-    # auto-detect chain.
-    if not runtime_base_url and _RUNTIME_MAIN_BASE_URL:
-        runtime_base_url = _RUNTIME_MAIN_BASE_URL
-    if not runtime_api_key and _RUNTIME_MAIN_API_KEY:
-        runtime_api_key = _RUNTIME_MAIN_API_KEY
-    if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
-        runtime_api_mode = _RUNTIME_MAIN_API_MODE
-
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
     #    scenario where a user switches providers via `hermes model` but the
@@ -3184,6 +3007,38 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
 # configured client given a (provider, model) pair.  It handles auth lookup,
 # base URL resolution, provider-specific headers, and API format differences
 # (Chat Completions vs Responses API for Codex).
+
+
+# ── Async ACP Wrapper ──────────────────────────────────────────────────────
+# CopilotACPClient is synchronous.  When auxiliary vision needs an async
+# client (async_call_llm), we must wrap the sync client so that
+# ``client.chat.completions.create()`` works in the async loop.
+
+import asyncio
+import types
+
+
+class _AsyncACPChat:
+    """Thin async proxy that delegates to the sync CopilotACPClient."""
+
+    def __init__(self, sync_client):
+        self._sync = sync_client
+        self.completions = self  # client.chat.completions.create() works
+
+    async def create(self, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: self._sync.chat.completions.create(**kwargs)
+        )
+
+
+class _AsyncACPWrapper:
+    """Minimal OpenAI-client-like wrapper exposing ``chat`` attribute."""
+
+    def __init__(self, sync_client):
+        self._sync = sync_client
+        self.chat = types.SimpleNamespace(completions=_AsyncACPChat(sync_client))
+        self.api_key = getattr(sync_client, "api_key", None)
 #
 # All auxiliary consumer code should go through this or the public helpers
 # below — never look up auth env vars ad-hoc.
@@ -3213,7 +3068,10 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
-            return sync_client, model
+            # Wrap sync CopilotACPClient for async use via asyncio.to_thread.
+            # Without this, async_call_llm (used by vision_analyze) fails with
+            # "object types.SimpleNamespace can't be used in 'await' expression".
+            return _AsyncACPWrapper(sync_client), model
     except ImportError:
         pass
 
@@ -3820,21 +3678,21 @@ def resolve_provider_client(
             or _read_main_model(),
             provider,
         )
-        if provider == "copilot-acp":
+        if provider in ("copilot-acp", "gemini-acp"):
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
             command = str(creds.get("command", "")).strip() or None
             args = list(creds.get("args") or [])
             if not final_model:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but no model "
-                    "was provided or configured"
+                    "resolve_provider_client: %s requested but no model "
+                    "was provided or configured", provider
                 )
                 return None, None
             if not api_key or not base_url:
                 logger.warning(
-                    "resolve_provider_client: copilot-acp requested but external "
-                    "process credentials are incomplete"
+                    "resolve_provider_client: %s requested but external "
+                    "process credentials are incomplete", provider
                 )
                 return None, None
             from agent.copilot_acp_client import CopilotACPClient
@@ -4874,23 +4732,24 @@ def _build_call_kwargs(
         kwargs["temperature"] = temperature
 
     if max_tokens is not None:
-        # We do NOT cap output by default. Most chat-completions providers treat
-        # an omitted max_tokens as "use the model's max output", which is what we
-        # want for auxiliary tasks (compression summaries, titles, vision, etc.) —
-        # an explicit cap only risks truncating a summary or 400-ing on providers
-        # that reject the parameter outright (e.g. GitHub Copilot / newer OpenAI
-        # GPT-5 models require max_completion_tokens, not max_tokens; ZAI vision
-        # models reject it entirely with error 1210). Omitting it sidesteps all of
-        # those wire-format quirks at once.
-        #
-        # The one exception is the Anthropic Messages wire (MiniMax and any
-        # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
-        # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
-        # there.
-        _effective_base = base_url or (
-            _current_custom_base_url() if provider == "custom" else ""
+        # Codex adapter handles max_tokens internally; OpenRouter/Nous use max_tokens.
+        # Direct OpenAI api.openai.com with newer models needs max_completion_tokens.
+        # ZAI vision models (glm-4v-flash, glm-4v-plus, etc.) reject max_tokens with
+        # error code 1210 ("API 调用参数有误") on multimodal requests — skip it.
+        _model_lower = (model or "").lower()
+        _skip_max_tokens = (
+            provider == "zai"
+            and ("4v" in _model_lower or "5v" in _model_lower or "-v" in _model_lower)
         )
-        if _is_anthropic_compat_endpoint(provider, _effective_base):
+        if _skip_max_tokens:
+            pass  # ZAI vision models do not accept max_tokens
+        elif provider == "custom":
+            custom_base = base_url or _current_custom_base_url()
+            if base_url_hostname(custom_base) == "api.openai.com":
+                kwargs["max_completion_tokens"] = max_tokens
+            else:
+                kwargs["max_tokens"] = max_tokens
+        else:
             kwargs["max_tokens"] = max_tokens
 
     if tools:
@@ -5142,72 +5001,11 @@ def call_llm(
                     raise
                 first_err = retry_err
 
-        # ── Stale-model self-heal (Nous Portal recommendation drift) ───
-        # A long-lived process can pin a Portal-recommended model that has
-        # since been dropped from the Nous → OpenRouter catalog, so every
-        # auxiliary call 404s with "model does not exist". Force a fresh
-        # Portal fetch and retry once with the current recommendation (or the
-        # known-good default). Only applies to Nous-routed calls.
-        _heal_is_nous = (
-            resolved_provider == "nous"
-            or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
-        )
-        if _is_model_not_found_error(first_err) and _heal_is_nous:
-            healed_model = _refresh_nous_recommended_model(
-                vision=(task == "vision"), stale_model=kwargs.get("model"))
-            if healed_model and healed_model != kwargs.get("model"):
-                logger.warning(
-                    "Auxiliary %s: model %r no longer in Nous catalog; "
-                    "retrying with refreshed recommendation %r",
-                    task or "call", kwargs.get("model"), healed_model,
-                )
-                kwargs["model"] = healed_model
-                try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
-                except Exception as retry_err:
-                    first_err = retry_err
-
         # ── Nous auth refresh parity with main agent ──────────────────
         client_is_nous = (
             resolved_provider == "nous"
             or base_url_host_matches(_base_info, "inference-api.nousresearch.com")
         )
-        if (
-            _is_payment_error(first_err)
-            and client_is_nous
-            and _nous_portal_account_has_fresh_paid_access()
-        ):
-            refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
-                cache_provider=resolved_provider or "nous",
-                model=final_model,
-                async_mode=False,
-                base_url=resolved_base_url,
-                api_key=resolved_api_key,
-                api_mode=resolved_api_mode,
-                main_runtime=main_runtime,
-                is_vision=(task == "vision"),
-            )
-            if refreshed_client is not None:
-                logger.info(
-                    "Auxiliary %s: refreshed Nous runtime credentials after paid account check, retrying",
-                    task or "call",
-                )
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
-                try:
-                    return _validate_llm_response(
-                        refreshed_client.chat.completions.create(**kwargs), task)
-                except Exception as retry_err:
-                    if not (
-                        _is_auth_error(retry_err)
-                        or _is_payment_error(retry_err)
-                        or _is_connection_error(retry_err)
-                        or _is_rate_limit_error(retry_err)
-                    ):
-                        raise
-                    first_err = retry_err
-
         if _is_auth_error(first_err) and client_is_nous:
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
@@ -5605,70 +5403,11 @@ async def async_call_llm(
                     raise
                 first_err = retry_err
 
-        # ── Stale-model self-heal (Nous Portal recommendation drift) ───
-        # See the sync call_llm() path for the rationale: a long-lived process
-        # can pin a Portal-recommended model that has since been dropped from
-        # the Nous → OpenRouter catalog, 404'ing every auxiliary call. Force a
-        # fresh Portal fetch and retry once with the current recommendation.
-        _heal_is_nous = (
-            resolved_provider == "nous"
-            or base_url_host_matches(_client_base, "inference-api.nousresearch.com")
-        )
-        if _is_model_not_found_error(first_err) and _heal_is_nous:
-            healed_model = _refresh_nous_recommended_model(
-                vision=(task == "vision"), stale_model=kwargs.get("model"))
-            if healed_model and healed_model != kwargs.get("model"):
-                logger.warning(
-                    "Auxiliary %s (async): model %r no longer in Nous catalog; "
-                    "retrying with refreshed recommendation %r",
-                    task or "call", kwargs.get("model"), healed_model,
-                )
-                kwargs["model"] = healed_model
-                try:
-                    return _validate_llm_response(
-                        await client.chat.completions.create(**kwargs), task)
-                except Exception as retry_err:
-                    first_err = retry_err
-
         # ── Nous auth refresh parity with main agent ──────────────────
         client_is_nous = (
             resolved_provider == "nous"
             or base_url_host_matches(_client_base, "inference-api.nousresearch.com")
         )
-        if (
-            _is_payment_error(first_err)
-            and client_is_nous
-            and _nous_portal_account_has_fresh_paid_access()
-        ):
-            refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
-                cache_provider=resolved_provider or "nous",
-                model=final_model,
-                async_mode=True,
-                base_url=resolved_base_url,
-                api_key=resolved_api_key,
-                api_mode=resolved_api_mode,
-                is_vision=(task == "vision"),
-            )
-            if refreshed_client is not None:
-                logger.info(
-                    "Auxiliary %s (async): refreshed Nous runtime credentials after paid account check, retrying",
-                    task or "call",
-                )
-                if refreshed_model and refreshed_model != kwargs.get("model"):
-                    kwargs["model"] = refreshed_model
-                try:
-                    return _validate_llm_response(
-                        await refreshed_client.chat.completions.create(**kwargs), task)
-                except Exception as retry_err:
-                    if not (
-                        _is_auth_error(retry_err)
-                        or _is_payment_error(retry_err)
-                        or _is_connection_error(retry_err)
-                        or _is_rate_limit_error(retry_err)
-                    ):
-                        raise
-                    first_err = retry_err
-
         if _is_auth_error(first_err) and client_is_nous:
             refreshed_client, refreshed_model = _refresh_nous_auxiliary_client(
                 cache_provider=resolved_provider or "nous",
