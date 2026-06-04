@@ -150,8 +150,12 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
+<<<<<<< HEAD
     conn = kb.connect()
     try:
+=======
+    with kb.connect_closing() as conn:
+>>>>>>> main
         task = kb.get_task(conn, task_id)
     finally:
         conn.close()
@@ -242,8 +246,12 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
+<<<<<<< HEAD
     conn = kb.connect()
     try:
+=======
+    with kb.connect_closing() as conn:
+>>>>>>> main
         ok = kb.specify_triage_task(
             conn,
             task_id,
@@ -267,8 +275,12 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
+<<<<<<< HEAD
     conn = kb.connect()
     try:
+=======
+    with kb.connect_closing() as conn:
+>>>>>>> main
         tasks = kb.list_tasks(
             conn,
             status="triage",

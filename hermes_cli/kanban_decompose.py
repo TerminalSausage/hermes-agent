@@ -281,8 +281,12 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
+<<<<<<< HEAD
     conn = kb.connect()
     try:
+=======
+    with kb.connect_closing() as conn:
+>>>>>>> main
         task = kb.get_task(conn, task_id)
     finally:
         conn.close()
@@ -373,8 +377,12 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
+<<<<<<< HEAD
         conn = kb.connect()
         try:
+=======
+        with kb.connect_closing() as conn:
+>>>>>>> main
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
@@ -445,8 +453,12 @@ def decompose_task(
         })
 
     try:
+<<<<<<< HEAD
         conn = kb.connect()
         try:
+=======
+        with kb.connect_closing() as conn:
+>>>>>>> main
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -476,8 +488,12 @@ def decompose_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
+<<<<<<< HEAD
     conn = kb.connect()
     try:
+=======
+    with kb.connect_closing() as conn:
+>>>>>>> main
         rows = kb.list_tasks(
             conn,
             status="triage",
