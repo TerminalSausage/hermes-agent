@@ -465,6 +465,39 @@ class TestInteractivePromptModalFieldTypes:
         assert fu.max_values == 5
         assert fu.min_values == 1
 
+    def test_file_upload_required_clamps_min_values_to_1(self):
+        """required=True without explicit min_files should clamp min_values to 1.
+
+        Discord rejects required=True with min_values=0 (50035).
+        """
+        modal = self._modal_with_fields([
+            {
+                "key": "doc",
+                "label": "Document",
+                "type": "file_upload",
+                "required": True,
+                # no file_policy → min_files defaults to 0
+            },
+        ])
+        fu = modal.children[0].component
+        assert fu.required is True
+        assert fu.min_values == 1  # clamped from 0 to 1
+        assert fu.max_values == 1  # default
+
+    def test_file_upload_optional_keeps_min_values_0(self):
+        """required=False should keep min_values=0 when no file_policy."""
+        modal = self._modal_with_fields([
+            {
+                "key": "doc",
+                "label": "Document",
+                "type": "file_upload",
+                "required": False,
+            },
+        ])
+        fu = modal.children[0].component
+        assert fu.required is False
+        assert fu.min_values == 0
+
 
 # ===========================================================================
 # Label wrapper tests — TDD for Discord modal API migration (Sep 2025)

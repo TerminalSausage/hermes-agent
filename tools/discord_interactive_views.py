@@ -460,11 +460,16 @@ if discord is not None:
 
                 elif field_type == "file_upload":
                     file_policy = field_spec.get("file_policy", {})
+                    _fu_required = field_spec.get("required", False)
+                    _fu_min = file_policy.get("min_files", 0)
+                    # Discord rejects required=True with min_values=0 (50035)
+                    if _fu_required and _fu_min < 1:
+                        _fu_min = 1
                     file_upload = _ui.FileUpload(
                         custom_id=key[:100],
-                        required=field_spec.get("required", False),
+                        required=_fu_required,
                         max_values=file_policy.get("max_files", 1),
-                        min_values=file_policy.get("min_files", 0),
+                        min_values=_fu_min,
                     )
                     label = _ui.Label(
                         text=field_label,
