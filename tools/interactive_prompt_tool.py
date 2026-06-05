@@ -391,6 +391,20 @@ def interactive_prompt_tool(
                         f"'{field_type}'. Must be one of {sorted(VALID_FIELD_TYPES)}."
                     )
 
+                # Choice fields (select, radio, checkbox) require at least one
+                # option — Discord rejects the modal payload otherwise (50035).
+                if field_type in ("select", "radio", "checkbox"):
+                    field_options = fld.get("options")
+                    if (
+                        not isinstance(field_options, list)
+                        or len(field_options) == 0
+                    ):
+                        return tool_error(
+                            f"Option {idx} modal field {fi} has type "
+                            f"'{field_type}' which requires at least one "
+                            f"option in 'options'."
+                        )
+
                 # file_policy validation (only relevant for file_upload fields)
                 if field_type == "file_upload":
                     file_policy = fld.get("file_policy")

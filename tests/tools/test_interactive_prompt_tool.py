@@ -540,3 +540,141 @@ class TestFilePolicyValidation:
         }
         result = self._call([opt])
         assert json.loads(result) is None
+
+
+# ===========================================================================
+# Choice-field options validation tests (select / radio / checkbox)
+# ===========================================================================
+
+
+class TestChoiceFieldOptionsValidation:
+    """select, radio, and checkbox fields must have at least one option.
+
+    Discord rejects the modal payload (50035) when these component types
+    are sent without options, so validation must catch it before it reaches
+    the adapter.
+    """
+
+    def _call(self, fields):
+        """Build a single modal option with the given fields and call the tool."""
+        from tools.interactive_prompt_tool import interactive_prompt_tool
+        opt = {
+            "label": "Form",
+            "value": "form",
+            "action": "modal",
+            "modal": {"title": "Test Form", "fields": fields},
+        }
+        return interactive_prompt_tool(
+            question="Pick",
+            options=[opt],
+            callback=lambda *a, **kw: None,
+        )
+
+    # --- select ---
+
+    def test_select_missing_options_rejected(self):
+        """select field without 'options' key should be rejected."""
+        result = self._call([{"key": "color", "label": "Color", "type": "select"}])
+        assert "error" in result
+        assert "select" in result
+        assert "at least one option" in result
+
+    def test_select_empty_options_rejected(self):
+        """select field with empty options list should be rejected."""
+        result = self._call([
+            {"key": "color", "label": "Color", "type": "select", "options": []},
+        ])
+        assert "error" in result
+        assert "select" in result
+        assert "at least one option" in result
+
+    def test_select_options_not_list_rejected(self):
+        """select field with non-list options should be rejected."""
+        result = self._call([
+            {"key": "color", "label": "Color", "type": "select", "options": "red"},
+        ])
+        assert "error" in result
+        assert "select" in result
+
+    def test_select_with_options_accepted(self):
+        """select field with at least one option should pass validation."""
+        result = self._call([
+            {"key": "color", "label": "Color", "type": "select",
+             "options": ["Red", "Green", "Blue"]},
+        ])
+        assert json.loads(result) is None  # callback returned None → passed
+
+    # --- radio ---
+
+    def test_radio_missing_options_rejected(self):
+        """radio field without 'options' key should be rejected."""
+        result = self._call([{"key": "size", "label": "Size", "type": "radio"}])
+        assert "error" in result
+        assert "radio" in result
+        assert "at least one option" in result
+
+    def test_radio_empty_options_rejected(self):
+        """radio field with empty options list should be rejected."""
+        result = self._call([
+            {"key": "size", "label": "Size", "type": "radio", "options": []},
+        ])
+        assert "error" in result
+        assert "radio" in result
+
+    def test_radio_with_options_accepted(self):
+        """radio field with at least one option should pass validation."""
+        result = self._call([
+            {"key": "size", "label": "Size", "type": "radio",
+             "options": ["Small", "Medium", "Large"]},
+        ])
+        assert json.loads(result) is None
+
+    # --- checkbox ---
+
+    def test_checkbox_missing_options_rejected(self):
+        """checkbox field without 'options' key should be rejected."""
+        result = self._call([
+            {"key": "prefs", "label": "Prefs", "type": "checkbox"},
+        ])
+        assert "error" in result
+        assert "checkbox" in result
+        assert "at least one option" in result
+
+    def test_checkbox_empty_options_rejected(self):
+        """checkbox field with empty options list should be rejected."""
+        result = self._call([
+            {"key": "prefs", "label": "Prefs", "type": "checkbox",
+             "options": []},
+        ])
+        assert "error" in result
+        assert "checkbox" in result
+
+    def test_checkbox_with_options_accepted(self):
+        """checkbox field with at least one option should pass validation."""
+        result = self._call([
+            {"key": "prefs", "label": "Prefs", "type": "checkbox",
+             "options": ["Email", "SMS", "Push"]},
+        ])
+        assert json.loads(result) is None
+
+    # --- text is unaffected ---
+
+    def test_text_field_no_options_still_accepted(self):
+        """text fields don't require options — should pass without them."""
+        result = self._call([
+            {"key": "name", "label": "Name", "type": "text"},
+        ])
+        assert json.loads(result) is None
+
+    # --- multiple choice fields in one modal ---
+
+    def test_multiple_choice_fields_all_need_options(self):
+        """If any choice field lacks options, the whole modal is rejected."""
+        result = self._call([
+            {"key": "color", "label": "Color", "type": "select",
+             "options": ["Red"]},
+            {"key": "size", "label": "Size", "type": "radio",
+             "options": []},  # this one is bad
+        ])
+        assert "error" in result
+        assert "radio" in result
