@@ -86,7 +86,7 @@ class TrackedComponentView:
     view: Any
     session_key: str = ""
     interaction_callback: Optional[Callable[[MessageEvent], Any]] = None
-    source: Optional[MessageSource] = None
+    source: Optional[SessionSource] = None
     rest_sent: bool = False
     resolved: bool = False
     chat_id: str = ""
@@ -105,7 +105,7 @@ class ComponentStore:
         view: Any,
         session_key: str = "",
         interaction_callback: Optional[Callable[[MessageEvent], Any]] = None,
-        source: Optional[MessageSource] = None,
+        source: Optional[SessionSource] = None,
         rest_sent: bool = False,
         chat_id: str = "",
     ) -> TrackedComponentView:
@@ -140,7 +140,7 @@ class ComponentView(discord.ui.View if discord is not None else object):  # type
         spec: Optional[dict],
         message_id: str = "",
         session_key: str = "",
-        source: Optional[MessageSource] = None,
+        source: Optional[SessionSource] = None,
         interaction_callback: Optional[Callable[[MessageEvent], Any]] = None,
         timeout: Optional[float] = 900,
     ) -> None:
@@ -273,7 +273,7 @@ class ComponentView(discord.ui.View if discord is not None else object):  # type
                 pass
             user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
             user_name = str(getattr(interaction, "user", "") or "")
-            source = MessageSource(
+            source = SessionSource(
                 platform="discord",
                 chat_id=channel_id,
                 user_id=user_id,
@@ -308,7 +308,7 @@ def build_view_from_spec(
     spec: Optional[dict],
     message_id: str = "",
     session_key: str = "",
-    source: Optional[MessageSource] = None,
+    source: Optional[SessionSource] = None,
     interaction_callback: Optional[Callable[[MessageEvent], Any]] = None,
 ) -> ComponentView:
     return ComponentView(

@@ -344,6 +344,9 @@ def has_pending(session_key: str) -> bool:
 def clear_session(session_key: str) -> int:
     """Cancel every pending entry for a session.
 
+    Skips entries already resolved (race-safe: won't overwrite a
+    user's response with "cancelled").
+
     Returns the number of entries cancelled.
     """
     with _lock:
@@ -353,6 +356,9 @@ def clear_session(session_key: str) -> int:
     for entry in entries:
         if entry is None:
             continue
+        if entry._resolved:
+            continue
+        entry._resolved = True
         entry.result = HumanInputResult(status="cancelled")
         entry.event.set()
         cancelled += 1
@@ -364,6 +370,8 @@ def clear_all() -> int:
 
     Called during gateway shutdown so in-flight interactive prompts
     resolve immediately instead of hanging until their timeout.
+    Skips entries already resolved (race-safe).
+
     Returns the total number of entries cancelled.
     """
     with _lock:
@@ -374,6 +382,9 @@ def clear_all() -> int:
     for entry in entries:
         if entry is None:
             continue
+        if entry._resolved:
+            continue
+        entry._resolved = True
         entry.result = HumanInputResult(status="cancelled")
         entry.event.set()
         cancelled += 1
