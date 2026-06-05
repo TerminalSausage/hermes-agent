@@ -1035,8 +1035,6 @@ AUTHOR_MAP = {
     "zyprothh@gmail.com": "Zyproth",
     "amitgaur@gmail.com": "amitgaur",
     "albuquerque.abner@gmail.com": "mrbob-git",
-<<<<<<< HEAD
-=======
     "kiala@users.noreply.github.com": "kiala9",
     "alanxchen@gmail.com": "alanxchen85",
     "clawbot@clawbots-Mac-mini.local": "John-tip",
@@ -1134,7 +1132,6 @@ AUTHOR_MAP = {
     "eloklam@eloklam-ubuntudesktop.tail21966c.ts.net": "eloklam",
     "clawdia@fmercurio-macstudio.local": "fmercurio",
     "ricardoporsche001@icloud.com": "Ricardo-M-L",
->>>>>>> main
     "leozeli@qq.com": "leozeli",
     "linlehao@cuhk.edu.cn": "LehaoLin",
     "liutong@isacas.ac.cn": "I3eg1nner",

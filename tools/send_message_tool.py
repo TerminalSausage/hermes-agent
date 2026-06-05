@@ -147,61 +147,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-<<<<<<< HEAD
-<<<<<<< HEAD
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
-            },
-            "components": {
-                "type": "array",
-                "description": (
-                    "Discord interactive components (buttons, select menus) to attach to the message. "
-                    "Each element is an action row containing components. Supported component types: "
-                    "'button' (type 2) with styles 'primary'(1), 'secondary'(2), 'success'(3), 'danger'(4), 'link'(5); "
-                    "'string_select' (type 3) with options array of {label, value}. "
-                    "Link buttons (style 'link') use 'url' instead of 'custom_id' and navigate the user to that URL. "
-                    "Non-link buttons require 'custom_id' to receive click interactions. "
-                    "All buttons support optional 'disabled': true. "
-                    "Example: [{\"components\": [{\"type\": \"button\", \"style\": \"primary\", \"label\": \"Approve\", \"custom_id\": \"approve\"}, "
-                    "{\"type\": \"button\", \"style\": \"danger\", \"label\": \"Reject\", \"custom_id\": \"reject\"}]}] "
-                    "Only used for Discord targets; ignored for other platforms."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "components": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "enum": ["button", "string_select"]},
-                                    "style": {"type": "string", "enum": ["primary", "secondary", "success", "danger", "link"]},
-                                    "label": {"type": "string"},
-                                    "custom_id": {"type": "string", "description": "Required for non-link buttons. Ignored for link buttons."},
-                                    "url": {"type": "string", "description": "Required for link buttons (style 'link'). Opens URL on click."},
-                                    "disabled": {"type": "boolean", "description": "If true, the component is shown but not interactive."},
-                                    "options": {
-                                        "type": "array",
-                                        "description": "Options for string_select menus.",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "label": {"type": "string", "description": "User-visible option label (max 100 chars)."},
-                                                "value": {"type": "string", "description": "Internal value returned on selection (max 100 chars)."}
-                                            },
-                                            "required": ["label", "value"]
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-=======
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> for a file under a Hermes media cache or HERMES_MEDIA_ALLOW_DIRS — the platform will deliver it as a native media attachment."
->>>>>>> main
-=======
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
->>>>>>> main
             }
         },
         "required": []
@@ -232,7 +178,6 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
-    components = args.get("components")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -374,11 +319,7 @@ def _handle_send(args):
                 cleaned_message,
                 thread_id=thread_id,
                 media_files=media_files,
-<<<<<<< HEAD
-                components=components,
-=======
                 force_document=force_document_attachments,
->>>>>>> main
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -540,10 +481,6 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
-<<<<<<< HEAD
-async def _send_via_adapter(platform, pconfig, chat_id, chunk, components=None):
-    """Send a message via a live gateway adapter (for plugin platforms).
-=======
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -556,7 +493,6 @@ async def _send_via_adapter(
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
->>>>>>> main
 
     Order of attempts:
       1. Live in-process adapter via ``_gateway_runner_ref()`` (the path that
@@ -576,20 +512,6 @@ async def _send_via_adapter(
     if runner is not None:
         try:
             adapter = runner.adapters.get(platform)
-<<<<<<< HEAD
-            if adapter:
-                from gateway.platforms.base import SendResult
-                metadata = {}
-                if components:
-                    metadata["components"] = components
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata or None)
-                if result.success:
-                    return {"success": True, "message_id": result.message_id}
-                return {"error": f"Adapter send failed: {result.error}"}
-    except Exception as e:
-        return {"error": f"Plugin platform send failed: {e}"}
-    return {"error": f"No live adapter for platform '{platform.value}'. Is the gateway running with this platform connected?"}
-=======
         except Exception:
             adapter = None
         if adapter is not None:
@@ -646,14 +568,9 @@ async def _send_via_adapter(
             f"register a standalone_sender_fn on its PlatformEntry."
         )
     }
->>>>>>> main
 
 
-<<<<<<< HEAD
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, components=None):
-=======
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
->>>>>>> main
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -760,11 +677,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chat_id,
                 chunk,
                 thread_id=thread_id,
-<<<<<<< HEAD
-                components=components if is_last else None,
-=======
                 media_files=media_files if is_last else [],
->>>>>>> main
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -852,8 +765,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
-    for i, chunk in enumerate(chunks):
-        is_last = (i == len(chunks) - 1)
+    for chunk in chunks:
         if platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
@@ -881,11 +793,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
         else:
-<<<<<<< HEAD
-            # Plugin platform — route through the gateway's live adapter
-            # if available, otherwise report the error.
-            result = await _send_via_adapter(platform, pconfig, chat_id, chunk, components=components if is_last else None)
-=======
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
             result = await _send_via_adapter(
@@ -897,7 +804,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files,
                 force_document=force_document,
             )
->>>>>>> main
 
         if isinstance(result, dict) and result.get("error"):
             return result
@@ -1143,351 +1049,6 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-<<<<<<< HEAD
-def _derive_forum_thread_name(message: str) -> str:
-    """Derive a thread name from the first line of the message, capped at 100 chars."""
-    first_line = message.strip().split("\n", 1)[0].strip()
-    # Strip common markdown heading prefixes
-    first_line = first_line.lstrip("#").strip()
-    if not first_line:
-        first_line = "New Post"
-    return first_line[:100]
-
-
-# Process-local cache for Discord channel-type probes.  Avoids re-probing the
-# same channel on every send when the directory cache has no entry (e.g. fresh
-# install, or channel created after the last directory build).
-_DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
-
-
-def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
-    _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
-
-
-def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
-    return _DISCORD_CHANNEL_TYPE_PROBE_CACHE.get(str(chat_id))
-
-
-_DISCORD_BUTTON_STYLE_MAP = {
-    "primary": 1,
-    "secondary": 2,
-    "success": 3,
-    "danger": 4,
-    "link": 5,
-}
-_DISCORD_COMPONENT_TYPE_MAP = {
-    "button": 2,
-    "string_select": 3,
-}
-
-
-def _prefix_custom_id(custom_id: str) -> str:
-    """Add the ``hermes:`` prefix to a custom_id for agent component filtering.
-
-    Mirrors the truncation logic in ``discord_components._truncate_custom_id``
-    so REST-sent and websocket-sent components use identical custom_ids.
-    """
-    if not custom_id:
-        return custom_id
-    import hashlib
-    prefixed = f"hermes:{custom_id}"
-    if len(prefixed) <= 100:
-        return prefixed
-    hsh = hashlib.sha256(custom_id.encode()).hexdigest()[:8]
-    return f"hermes:{custom_id[:100 - 9 - 7]}_{hsh}"
-
-
-def _build_discord_components(spec):
-    """Convert agent-friendly component spec to Discord API action-row format.
-
-    Input: list of action-row dicts, each with a ``components`` array of
-    button/select specs using human-readable type/style names.
-
-    Output: list of Discord API action-row objects ready for the REST JSON
-    payload (``components`` field on ``POST /messages``).
-    """
-    if not spec:
-        return None
-
-    action_rows = []
-    for row in spec:
-        api_components = []
-        for comp in row.get("components", []):
-            comp_type = comp.get("type", "button")
-            api_type = _DISCORD_COMPONENT_TYPE_MAP.get(comp_type)
-            if api_type is None:
-                continue
-
-            if api_type == 2:  # Button
-                style = _DISCORD_BUTTON_STYLE_MAP.get(comp.get("style", "secondary"), 2)
-                is_link = (style == 5)
-
-                api_comp: dict = {
-                    "type": 2,
-                    "style": style,
-                    "label": comp.get("label", ""),
-                }
-
-                if is_link:
-                    # Link buttons use `url` instead of `custom_id`.
-                    # Discord rejects custom_id on link buttons.
-                    url = comp.get("url", "")
-                    if not url:
-                        continue  # skip malformed link buttons
-                    api_comp["url"] = url
-                else:
-                    custom_id = comp.get("custom_id", "")
-                    api_comp["custom_id"] = _prefix_custom_id(custom_id)
-
-                if comp.get("disabled"):
-                    api_comp["disabled"] = True
-            elif api_type == 3:  # String Select
-                custom_id = comp.get("custom_id", "")
-                api_comp = {
-                    "type": 3,
-                    "custom_id": _prefix_custom_id(custom_id),
-                    "options": [
-                        {"label": opt.get("label", ""), "value": opt.get("value", "")}
-                        for opt in comp.get("options", [])
-                    ],
-                }
-            else:
-                continue
-
-            api_components.append(api_comp)
-
-        if api_components:
-            action_rows.append({"type": 1, "components": api_components})
-
-    return action_rows if action_rows else None
-
-
-async def _send_discord(token, chat_id, message, thread_id=None, media_files=None, components=None):
-    """Send a single message via Discord REST API (no websocket client needed).
-
-    Chunking is handled by _send_to_platform() before this is called.
-
-    When thread_id is provided, the message is sent directly to that thread
-    via the /channels/{thread_id}/messages endpoint.
-
-    Media files are uploaded one-by-one via multipart/form-data after the
-    text message is sent (same pattern as Telegram).
-
-    Forum channels (type 15) reject POST /messages — a thread post is created
-    automatically via POST /channels/{id}/threads.  Media files are uploaded
-    as multipart attachments on the starter message of the new thread.
-
-    Channel type is resolved from the channel directory first, then a
-    process-local probe cache, and only as a last resort with a live
-    GET /channels/{id} probe (whose result is memoized).
-    """
-    try:
-        import aiohttp
-    except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
-    try:
-        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-        _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        auth_headers = {"Authorization": f"Bot {token}"}
-        json_headers = {**auth_headers, "Content-Type": "application/json"}
-        media_files = media_files or []
-        last_data = None
-        warnings = []
-
-        # Thread endpoint: Discord threads are channels; send directly to the thread ID.
-        if thread_id:
-            url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
-        else:
-            # Check if the target channel is a forum channel (type 15).
-            # Forum channels reject POST /messages — create a thread post instead.
-            # Three-layer detection: directory cache → process-local probe
-            # cache → GET /channels/{id} probe (with result memoized).
-            _channel_type = None
-            try:
-                from gateway.channel_directory import lookup_channel_type
-                _channel_type = lookup_channel_type("discord", chat_id)
-            except Exception:
-                pass
-
-            if _channel_type == "forum":
-                is_forum = True
-            elif _channel_type is not None:
-                is_forum = False
-            else:
-                cached = _probe_is_forum_cached(chat_id)
-                if cached is not None:
-                    is_forum = cached
-                else:
-                    is_forum = False
-                    try:
-                        info_url = f"https://discord.com/api/v10/channels/{chat_id}"
-                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as info_sess:
-                            async with info_sess.get(info_url, headers=json_headers, **_req_kw) as info_resp:
-                                if info_resp.status == 200:
-                                    info = await info_resp.json()
-                                    is_forum = info.get("type") == 15
-                                    _remember_channel_is_forum(chat_id, is_forum)
-                    except Exception:
-                        logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
-
-            if is_forum:
-                thread_name = _derive_forum_thread_name(message)
-                thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
-
-                # Filter to readable media files up front so we can pick the
-                # right code path (JSON vs multipart) before opening a session.
-                valid_media = []
-                for media_path, _is_voice in media_files:
-                    if not os.path.exists(media_path):
-                        warning = f"Media file not found, skipping: {media_path}"
-                        logger.warning(warning)
-                        warnings.append(warning)
-                        continue
-                    valid_media.append(media_path)
-
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), **_sess_kw) as session:
-                    if valid_media:
-                        # Multipart: payload_json + files[N] creates a forum
-                        # thread with the starter message plus attachments in
-                        # a single API call.
-                        attachments_meta = [
-                            {"id": str(idx), "filename": os.path.basename(path)}
-                            for idx, path in enumerate(valid_media)
-                        ]
-                        starter_message = {"content": message, "attachments": attachments_meta}
-                        payload_json = json.dumps({"name": thread_name, "message": starter_message})
-
-                        form = aiohttp.FormData()
-                        form.add_field("payload_json", payload_json, content_type="application/json")
-
-                        # Buffer file bytes up front — aiohttp's FormData can
-                        # read lazily and we don't want handles closing under
-                        # it on retry.
-                        try:
-                            for idx, media_path in enumerate(valid_media):
-                                with open(media_path, "rb") as fh:
-                                    form.add_field(
-                                        f"files[{idx}]",
-                                        fh.read(),
-                                        filename=os.path.basename(media_path),
-                                    )
-                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
-                                if resp.status not in {200, 201}:
-                                    body = await resp.text()
-                                    return _error(f"Discord forum thread creation error ({resp.status}): {body}")
-                                data = await resp.json()
-                        except Exception as e:
-                            return _error(_sanitize_error_text(f"Discord forum thread upload failed: {e}"))
-                    else:
-                        # No media — simple JSON POST creates the thread with
-                        # just the text starter.
-                        async with session.post(
-                            thread_url,
-                            headers=json_headers,
-                            json={
-                                "name": thread_name,
-                                "message": {"content": message},
-                            },
-                            **_req_kw,
-                        ) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await resp.text()
-                                return _error(f"Discord forum thread creation error ({resp.status}): {body}")
-                            data = await resp.json()
-
-                thread_id_created = data.get("id")
-                starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
-                result = {
-                    "success": True,
-                    "platform": "discord",
-                    "chat_id": chat_id,
-                    "thread_id": thread_id_created,
-                    "message_id": starter_msg_id,
-                }
-                if warnings:
-                    result["warnings"] = warnings
-                return result
-
-            url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            # Send text message (skip if empty and media is present)
-            if message.strip() or not media_files:
-<<<<<<< HEAD
-                payload = {"content": message}
-                discord_components = _build_discord_components(components)
-                if discord_components:
-                    payload["components"] = discord_components
-                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
-                    if resp.status not in (200, 201):
-=======
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in {200, 201}:
->>>>>>> main
-                        body = await resp.text()
-                        return _error(f"Discord API error ({resp.status}): {body}")
-                    last_data = await resp.json()
-
-            # Send each media file as a separate multipart upload
-            for media_path, _is_voice in media_files:
-                if not os.path.exists(media_path):
-                    warning = f"Media file not found, skipping: {media_path}"
-                    logger.warning(warning)
-                    warnings.append(warning)
-                    continue
-                try:
-                    form = aiohttp.FormData()
-                    filename = os.path.basename(media_path)
-                    with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await resp.text()
-                                warning = _sanitize_error_text(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = await resp.json()
-                except Exception as e:
-                    warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
-                    logger.error(warning)
-                    warnings.append(warning)
-
-        if last_data is None:
-            error = "No deliverable text or media remained after processing"
-            if warnings:
-                return {"error": error, "warnings": warnings}
-            return {"error": error}
-
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
-        if warnings:
-            result["warnings"] = warnings
-
-        # Register REST-sent components in the ComponentStore so the
-        # Discord adapter's on_raw_interaction handler can route clicks.
-        if discord_components and result.get("message_id"):
-            try:
-                from gateway.platforms.discord_components import component_store
-                component_store.register(
-                    message_id=result["message_id"],
-                    view=None,  # No discord.py View for REST-sent messages
-                    session_key="",  # Filled by adapter on interaction
-                    interaction_callback=None,  # Handled by adapter directly
-                    source=None,  # Built by adapter on interaction
-                    rest_sent=True,
-                    chat_id=str(chat_id),
-                )
-            except Exception:
-                logger.warning("Failed to register REST-sent components in ComponentStore", exc_info=True)
-
-        return result
-    except Exception as e:
-        return _error(f"Discord send failed: {e}")
-
-
-=======
->>>>>>> main
 async def _send_slack(token, chat_id, message):
     """Send via Slack Web API."""
     try:

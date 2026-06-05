@@ -169,34 +169,16 @@ class TestGatewayQuickCommands:
         assert result == "ok"
 
     @pytest.mark.asyncio
-<<<<<<< HEAD
-    async def test_exec_command_quoted_args_are_substituted_safely(self):
-        from gateway.run import GatewayRunner
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner.config = {"quick_commands": {"limits": {"type": "exec", "command": "printf %s {args}"}}}
-=======
     async def test_exec_command_does_not_leak_credentials(self):
         """Quick command exec must sanitize env — API keys must not appear in output."""
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = {"quick_commands": {"leak": {"type": "exec", "command": "env"}}}
->>>>>>> main
         runner._running_agents = {}
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
 
-<<<<<<< HEAD
-        event = self._make_event("limits", "hello world")
-        with patch("asyncio.create_subprocess_shell") as mock_shell:
-            proc = AsyncMock()
-            proc.communicate.return_value = (b"ok", b"")
-            proc.returncode = 0
-            mock_shell.return_value = proc
-            await runner._handle_message(event)
-        called_cmd = mock_shell.call_args[0][0]
-        assert "'hello world'" in called_cmd or '"hello world"' in called_cmd
-=======
         event = self._make_event("leak")
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-secret-12345"}):
             result = await runner._handle_message(event)
@@ -225,7 +207,6 @@ class TestGatewayQuickCommands:
 
         assert "supersecretkey1234567890" not in result, \
             "Quick command output not redacted — raw API key returned to user"
->>>>>>> main
 
     @pytest.mark.asyncio
     async def test_unsupported_type_returns_error(self):

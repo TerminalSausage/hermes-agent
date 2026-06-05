@@ -1133,6 +1133,7 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".ts": "text/plain",
     ".py": "text/plain",
     ".sh": "text/plain",
+    ".ps1": "text/plain",
 }
 
 
@@ -2419,8 +2420,6 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
-<<<<<<< HEAD
-=======
     async def send_clarify(
         self,
         chat_id: str,
@@ -2478,6 +2477,68 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    async def send_human_input(
+        self,
+        chat_id: str,
+        question: str,
+        options: list,
+        prompt_id: str,
+        session_key: str,
+        display_type: str = "buttons",
+        auth_policy: str = "session_owner_only",
+        origin_user_id: Optional[str] = None,
+        timeout_seconds: float = 900,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive prompt with per-option actions.
+
+        Default text fallback — renders a numbered list of options.
+        Adapters with rich UIs (Discord, Telegram) override this to render
+        buttons, select menus, and modal popups.
+
+        The resolution flow mirrors clarify:
+
+        * **Return options** — user picks a choice → adapter calls
+          ``tools.human_input_gateway.resolve_choice(prompt_id, value, actor)``.
+        * **Modal options** — user picks a choice that opens a modal →
+          adapter renders modal, collects fields, calls
+          ``tools.human_input_gateway.resolve_modal(prompt_id, value, fields, files, actor)``.
+        * **Timeout** — gateway's ``wait_for_response`` handles this.
+        """
+        if display_type != "buttons":
+            logger.debug(
+                "send_human_input text fallback ignoring display_type=%r",
+                display_type,
+            )
+        lines = [f"🔘 {question}", ""]
+        for i, opt in enumerate(options, start=1):
+            label = opt.get("label", f"Option {i}")
+            desc = opt.get("description", "")
+            action = opt.get("action", "return")
+            suffix = " (opens form — not available on this platform)" if action == "modal" else ""
+            line = f"  {i}. {label}{suffix}"
+            if desc:
+                line += f" — {desc}"
+            lines.append(line)
+        lines.append("")
+        lines.append("Reply with the number or option text.")
+        text = "\n".join(lines)
+
+        # Text fallback: mark this entry as awaiting text so the gateway
+        # text-intercept picks up the user's typed reply instead of hanging
+        # until timeout.
+        try:
+            from tools.human_input_gateway import mark_awaiting_text as _mark_text
+            _mark_text(prompt_id)
+        except Exception:
+            pass
+
+        return await self.send(
+            chat_id=chat_id,
+            content=text,
+            metadata=metadata,
+        )
+
     async def send_private_notice(
         self,
         chat_id: str,
@@ -2498,7 +2559,6 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
->>>>>>> main
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
@@ -3761,11 +3821,7 @@ class BasePlatformAdapter(ABC):
                 _r = await self._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_text,
-<<<<<<< HEAD
-                    reply_to=None if _no_reply else event.message_id,
-=======
                     reply_to=_reply_anchor_for_event(event),
->>>>>>> main
                     metadata=thread_meta,
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
@@ -3865,11 +3921,7 @@ class BasePlatformAdapter(ABC):
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
-<<<<<<< HEAD
-                            reply_to=None if _no_reply else event.message_id,
-=======
                             reply_to=_reply_anchor_for_event(event),
->>>>>>> main
                             metadata=_thread_meta,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
@@ -4200,9 +4252,6 @@ class BasePlatformAdapter(ABC):
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-<<<<<<< HEAD
-                    _no_reply = os.getenv("DISCORD_NO_REPLY", "").lower() in ("true", "1", "yes")
-=======
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Mark final response messages for notification delivery.
                     # Platform adapters that support per-message notification
@@ -4216,7 +4265,6 @@ class BasePlatformAdapter(ABC):
                         _thread_metadata["notify"] = True
                     else:
                         _thread_metadata = {"notify": True}
->>>>>>> main
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
@@ -4485,8 +4533,6 @@ class BasePlatformAdapter(ABC):
                         await asyncio.wait_for(_post_result, timeout=30.0)
                 except (asyncio.TimeoutError, Exception):
                     pass
-<<<<<<< HEAD
-=======
             # Stop typing indicator
             await _stop_typing_task()
             # Also cancel any platform-level persistent typing tasks (e.g. Discord)
@@ -4499,7 +4545,6 @@ class BasePlatformAdapter(ABC):
             # Final drain/release boundary: force-flush any timer that missed
             # the in-band drain before deciding whether the guard can clear.
             await self._flush_text_debounce_now(session_key)
->>>>>>> main
             # Late-arrival drain: a message may have arrived during the
             # cleanup awaits above (typing_task cancel, stop_typing).  Such
             # messages passed the Level-1 guard (entry still live, Event
@@ -4822,3 +4867,4 @@ class BasePlatformAdapter(ABC):
             ]
 
         return chunks
+
