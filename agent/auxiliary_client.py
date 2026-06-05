@@ -3679,9 +3679,11 @@ def resolve_provider_client(
             provider,
         )
         if provider in ("copilot-acp", "gemini-acp"):
+            # Both Copilot and Gemini CLI share the same ACP subprocess
+            # transport — the only difference is the default command.
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
-            command = str(creds.get("command", "")).strip() or None
+            command = str(creds.get("command", "").strip()) or None
             args = list(creds.get("args") or [])
             if not final_model:
                 logger.warning(
@@ -3695,6 +3697,12 @@ def resolve_provider_client(
                     "process credentials are incomplete", provider
                 )
                 return None, None
+            # Gemini ACP defaults to `gemini` command when no explicit
+            # command is configured in credentials.
+            if provider == "gemini-acp" and not command:
+                command = "gemini"
+                if not args:
+                    args = ["--acp", "--skip-trust"]
             from agent.copilot_acp_client import CopilotACPClient
 
             client = CopilotACPClient(

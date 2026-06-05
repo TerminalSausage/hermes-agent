@@ -6175,17 +6175,16 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    # Provider-specific command/args resolution
-    if provider_id == "gemini-acp":
+    is_gemini = provider_id == "gemini-acp"
+    if is_gemini:
         command = (
             os.getenv("HERMES_GEMINI_ACP_COMMAND", "").strip()
+            or os.getenv("GEMINI_CLI_PATH", "").strip()
             or "gemini"
         )
         raw_args = os.getenv("HERMES_GEMINI_ACP_ARGS", "").strip()
-        args = shlex.split(raw_args) if raw_args else ["--experimental-acp"]
-        api_key_label = "gemini-acp"
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--skip-trust"]
     else:
-        # Default: GitHub Copilot ACP
         command = (
             os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
             or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -6193,19 +6192,24 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         )
         raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
         args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-        api_key_label = "copilot-acp"
 
     resolved_command = shutil.which(command) if command else None
-    if not resolved_command and not base_url.startswith("acp+tcp://"):
+    cli_name = "Gemini CLI" if is_gemini else "Copilot CLI"
+    cli_env = (
+        "HERMES_GEMINI_ACP_COMMAND/GEMINI_CLI_PATH" if is_gemini
+        else "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH"
+    )
+    if not resolved_command and not base_url.startswith(("acp://", "acp+tcp://")):
         raise AuthError(
-            f"Could not find the ACP command '{command}' for provider '{provider_id}'.",
+            f"Could not find the {cli_name} command '{command}'. "
+            f"Install {cli_name} or set {cli_env}.",
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_cli",
         )
 
     return {
         "provider": provider_id,
-        "api_key": api_key_label,
+        "api_key": "***",
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
