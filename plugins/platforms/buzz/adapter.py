@@ -430,6 +430,11 @@ class BuzzAdapter(BasePlatformAdapter):
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
         self._channel_state: Dict[str, dict] = {}
+        # event_id -> author pubkey (lower). Lets _is_reply_to_self resolve
+        # CLI-authored replies (no parent-author p-tag) by looking up who
+        # wrote the message the reply e-tag points at. Seeded from channel
+        # history alongside "seen", populated from live events + our sends.
+        self._event_authors: Dict[str, str] = {}
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
@@ -629,7 +634,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if event_id:
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
-            self._mark_seen(str(chat_id), str(event_id))
+            self._mark_seen(str(chat_id), str(event_id), author=self._self_pubkey)
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -694,7 +699,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 data = {}
             event_id = data.get("event_id")
             if event_id:
-                self._mark_seen(str(chat_id), str(event_id))
+                self._mark_seen(str(chat_id), str(event_id), author=self._self_pubkey)
             return SendResult(
                 success=bool(data.get("accepted", True)),
                 message_id=str(event_id) if event_id else None,
@@ -940,6 +945,7 @@ class BuzzAdapter(BasePlatformAdapter):
             created_at = int(event.get("created_at") or 0)
             if event_id:
                 state["seen"][str(event_id)] = None
+                self._remember_author(str(event_id), str(event.get("pubkey") or "").lower())
             state["last_ts"] = max(state["last_ts"], created_at)
             # History is never dispatched, but it still classifies: a DM that
             # leaked in via ``channels list`` latches to chat_type="dm" here,
@@ -1015,6 +1021,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return
         state["seen"][event_id] = None
         state["last_ts"] = max(state["last_ts"], created_at)
+        self._remember_author(event_id, str(event.get("pubkey") or "").lower())
 
         if int(event.get("kind") or 0) != _CHAT_KIND:
             return
@@ -1186,6 +1193,14 @@ class BuzzAdapter(BasePlatformAdapter):
                 and str(tag[1]).lower() == self._self_pubkey
             ):
                 return True
+        # CLI-authored replies carry no parent-author p-tag; resolve the
+        # reply/root e-tags through the authorship cache instead. A reply to
+        # any of our own messages is "talking to us".
+        for tag in event.get("tags") or []:
+            if isinstance(tag, (list, tuple)) and len(tag) >= 2 and tag[0] == "e":
+                parent_author = self._event_authors.get(str(tag[1]))
+                if parent_author == self._self_pubkey:
+                    return True
         return False
 
     def _is_mentioned(self, content: str) -> bool:
@@ -1256,11 +1271,21 @@ class BuzzAdapter(BasePlatformAdapter):
         while len(seen) > _SEEN_CAP:
             seen.popitem(last=False)
 
-    def _mark_seen(self, channel_id: str, event_id: str) -> None:
+    def _remember_author(self, event_id: str, pubkey: Optional[str]) -> None:
+        """Record an event's author (pubkey, lower) for reply-target lookups."""
+        if event_id and pubkey:
+            self._event_authors[str(event_id)] = str(pubkey).lower()
+            # Bounded: same order of magnitude as the seen cache.
+            while len(self._event_authors) > _SEEN_CAP * 2:
+                self._event_authors.pop(next(iter(self._event_authors)))
+
+    def _mark_seen(self, channel_id: str, event_id: str, author: Optional[str] = None) -> None:
         state = self._channel_state.get(channel_id)
         if state is not None:
             state["seen"][event_id] = None
             self._trim_seen(state)
+        if author is not None:
+            self._remember_author(event_id, author)
 
     async def _dispatch_message(
         self,
