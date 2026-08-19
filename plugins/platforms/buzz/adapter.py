@@ -1034,8 +1034,15 @@ class BuzzAdapter(BasePlatformAdapter):
         is_dm = state["chat_type"] == "dm"
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        # DMs always dispatch. A threaded reply that p-tags us (replying TO
+        # our message; clients may render that mention invisibly) counts as
+        # addressed, same as a typed @mention.
+        if (
+            not is_dm
+            and self.require_mention
+            and not self._is_mentioned(content)
+            and not self._is_reply_to_self(event)
+        ):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
@@ -1050,6 +1057,22 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        # ── Thread support (NIP-10) ────────────────────────────────────────
+        # Replies carry ["e", <root-id>, ..., "reply"] tags. The root id is
+        # the thread anchor: it keys the session (gateway core appends
+        # "thread: <id>" to the session key) and routes the agent's response
+        # back into the thread (send() passes --reply-to from thread_id).
+        root_event_id = None
+        for tag in event.get("tags") or []:
+            if (
+                isinstance(tag, (list, tuple))
+                and len(tag) >= 2
+                and tag[0] == "e"
+                and tag[1]
+            ):
+                root_event_id = str(tag[1])
+                break
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1058,6 +1081,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=root_event_id,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1137,6 +1161,32 @@ class BuzzAdapter(BasePlatformAdapter):
         state["chat_type"] = "dm"
         self._channel_names.setdefault(channel_id, "DM")
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
+
+    def _is_reply_to_self(self, event: dict) -> bool:
+        """True when the event is a reply to one of our own messages.
+
+        Clients attach a structural ``["p", <our pubkey>]`` tag when replying
+        to our events (parent-author addressing, NIP-10). The replying client
+        may render that mention invisibly, so the text-level ``_is_mentioned``
+        check can miss it — but semantically the user IS talking to us, and
+        the whole thread belongs to us (we anchored it). Threads the agent
+        itself started keep their mention-free gating even when another
+        member jumps in mid-thread.
+
+        Distinguished from DM classification (``_is_direct_message_event``):
+        that keys off p-tag ``to self WITHOUT a visible mention`` to spot DMs
+        leaked into the channel watch list. Here the p-tag is exactly the
+        ``replying to our message`` signal we want, mention or not.
+        """
+        for tag in event.get("tags") or []:
+            if (
+                isinstance(tag, (list, tuple))
+                and len(tag) >= 2
+                and tag[0] in ("p", "mention")
+                and str(tag[1]).lower() == self._self_pubkey
+            ):
+                return True
+        return False
 
     def _is_mentioned(self, content: str) -> bool:
         """True when the message addresses this agent (npub, hex, or name)."""
@@ -1221,6 +1271,7 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1232,6 +1283,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
