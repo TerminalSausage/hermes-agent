@@ -728,6 +728,61 @@ class BuzzAdapter(BasePlatformAdapter):
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send any file as a native attachment via --file (flat-threaded)."""
+        args = [
+            "messages", "send",
+            "--channel", str(chat_id),
+            "--file", str(file_path),
+            "--content", "-",
+        ]
+        # Flat threading (see send()): thread root wins over the parent.
+        reply_target = (metadata or {}).get("thread_id") or reply_to
+        if reply_target:
+            args += ["--reply-to", str(reply_target)]
+        code, out, err = await self._run_cli(args, input_text=caption or "")
+        if code != 0:
+            return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            data = {}
+        event_id = data.get("event_id")
+        if event_id:
+            self._mark_seen(str(chat_id), str(event_id), author=self._self_pubkey)
+        return SendResult(
+            success=bool(data.get("accepted", True)),
+            message_id=str(event_id) if event_id else None,
+            raw_response=data,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video as a native attachment (same --file path as documents)."""
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=video_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = str(chat_id)
         state = self._channel_state.get(chat_id)
@@ -1111,6 +1166,22 @@ class BuzzAdapter(BasePlatformAdapter):
                     root_event_id = str(tag[1])
                     break
 
+        # Session/thread keying (see build_session_key in gateway/session.py):
+        #   * DMs key sessions by chat_id alone — a thread_id here would SPLIT
+        #     a threaded DM conversation across two sessions, so DMs never
+        #     carry one, even when the client attached e-tags.
+        #   * In shared channels, a root-level (unthreaded) message is treated
+        #     as its own thread root (synthetic thread, the Slack/Discord
+        #     "prospective_thread_id" pattern): the summons's event id IS the
+        #     id its first reply will anchor to. This keeps turn 1 (summons)
+        #     and turns 2+ (inside the spawned thread) in ONE session, and
+        #     gives interim/status/media sends a thread_id to anchor to on
+        #     turn 1, before any reply exists.
+        if is_dm:
+            dispatch_thread_id = None
+        else:
+            dispatch_thread_id = root_event_id or event_id
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1119,7 +1190,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
-            thread_id=root_event_id,
+            thread_id=dispatch_thread_id,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
