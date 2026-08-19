@@ -616,7 +616,14 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        # NIP-10 flat threading: when we have thread context (root event id),
+        # anchor to the ROOT rather than the immediate parent message.
+        # Anchoring to the parent makes every reply spawn a nested sub-thread
+        # under the previous message in tree-rendering clients (Buzz Desktop);
+        # anchoring to the root keeps the whole conversation one flat thread.
+        # reply_to (no thread context = root-level summons) still creates the
+        # thread off the summoning message.
+        reply_target = (metadata or {}).get("thread_id") or reply_to
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -690,6 +697,18 @@ class BuzzAdapter(BasePlatformAdapter):
             ]
             if reply_to:
                 args += ["--reply-to", str(reply_to)]
+            # Flat threading (see send()): thread root wins over the parent.
+            thread_root = (metadata or {}).get("thread_id")
+            if thread_root:
+                filtered, skip_next = [], False
+                for a in args:
+                    if skip_next:
+                        skip_next = False
+                    elif a == "--reply-to":
+                        skip_next = True
+                    else:
+                        filtered.append(a)
+                args = filtered + ["--reply-to", str(thread_root)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1065,20 +1084,32 @@ class BuzzAdapter(BasePlatformAdapter):
         dispatch_text = self._strip_mention(content)
 
         # ── Thread support (NIP-10) ────────────────────────────────────────
-        # Replies carry ["e", <root-id>, ..., "reply"] tags. The root id is
-        # the thread anchor: it keys the session (gateway core appends
-        # "thread: <id>" to the session key) and routes the agent's response
-        # back into the thread (send() passes --reply-to from thread_id).
+        # Replies carry e tags anchoring the thread. Prefer an explicit
+        # ``root`` marker (clients may order tags arbitrarily, and a nested
+        # reply carries BOTH root+reply — first-tag-wins would grab the wrong
+        # one); fall back to the first e-tag (single-reply-marker form, where
+        # the reply target of a direct reply IS the root).
         root_event_id = None
         for tag in event.get("tags") or []:
             if (
                 isinstance(tag, (list, tuple))
-                and len(tag) >= 2
+                and len(tag) >= 4
                 and tag[0] == "e"
+                and str(tag[3]).lower() == "root"
                 and tag[1]
             ):
                 root_event_id = str(tag[1])
                 break
+        if root_event_id is None:
+            for tag in event.get("tags") or []:
+                if (
+                    isinstance(tag, (list, tuple))
+                    and len(tag) >= 2
+                    and tag[0] == "e"
+                    and tag[1]
+                ):
+                    root_event_id = str(tag[1])
+                    break
 
         await self._dispatch_message(
             text=dispatch_text,
