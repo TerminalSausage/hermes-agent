@@ -435,6 +435,12 @@ class BuzzAdapter(BasePlatformAdapter):
         # wrote the message the reply e-tag points at. Seeded from channel
         # history alongside "seen", populated from live events + our sends.
         self._event_authors: Dict[str, str] = {}
+        # thread root id -> None (ordered set). Threads this agent
+        # PARTICIPATES in: was addressed by the root summons, replied into,
+        # or dispatched inside. Bounds the owner-followup exemption so a
+        # summons for ANOTHER agent never pulls this one into the thread
+        # (2026-08-19: @SADmin summons + owner follow-up dragged Pepper in).
+        self._participating_threads: "OrderedDict[str, None]" = OrderedDict()
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
@@ -642,6 +648,9 @@ class BuzzAdapter(BasePlatformAdapter):
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id), author=self._self_pubkey)
+            if reply_target:
+                # We just sent into this thread: we participate in it.
+                self._remember_participation(str(reply_target))
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -1043,6 +1052,20 @@ class BuzzAdapter(BasePlatformAdapter):
             # leaked in via ``channels list`` latches to chat_type="dm" here,
             # so it bypasses the mention gate from the very first poll.
             self._maybe_latch_dm(channel_id, state, event)
+            # Participation seeding: threads this agent was summoned into
+            # (root addressed us) or replied in (our own in-thread events)
+            # keep their owner-followup exemption across restarts.
+            hist_pub = str(event.get("pubkey") or "").lower()
+            hist_root = self._thread_root_id(event)
+            if hist_pub == self._self_pubkey:
+                if hist_root:
+                    self._remember_participation(hist_root)
+            elif not hist_root and event_id:
+                hist_content = event.get("content")
+                if self._event_p_tags_self(event) or (
+                    isinstance(hist_content, str) and self._is_mentioned(hist_content)
+                ):
+                    self._remember_participation(str(event_id))
         self._trim_seen(state)
 
     async def _discover_dms(self, *, seed: bool) -> None:
@@ -1138,7 +1161,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # addressed, same as a typed @mention. The thread's owner (author of
         # the root event) replying in their own thread without any mention is
         # also addressed — flat anchoring means their reply e-tags the ROOT,
-        # not our message, so the reply-to-self path alone would miss it.
+        # not our message, so the reply-to-self path alone would miss it —
+        # but ONLY in threads this agent participates in; an owner follow-up
+        # in a thread summoned for ANOTHER agent must not dispatch here
+        # (see _is_thread_owner_followup).
         # NOTE: display-name matching requires an explicit '@' (see
         # _is_mentioned) — prose references ("SADmin's handiwork") must NOT
         # pass the gate, or two agents participating in the same thread
@@ -1184,6 +1210,11 @@ class BuzzAdapter(BasePlatformAdapter):
             dispatch_thread_id = None
         else:
             dispatch_thread_id = root_event_id or event_id
+            # The gate admitted this event (mention / reply-to-self /
+            # owner follow-up in a thread we participate in): we are (now)
+            # a participant in this thread, so the owner's FUTURE un-mentioned
+            # follow-ups keep dispatching here without a fresh summons.
+            self._remember_participation(dispatch_thread_id)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1341,15 +1372,21 @@ class BuzzAdapter(BasePlatformAdapter):
         return root_event_id
 
     def _is_thread_owner_followup(self, event: dict, pubkey: str) -> bool:
-        """True when ``pubkey`` authored the thread's ROOT and is now posting
-        an in-thread follow-up without mentioning anyone.
+        """True when ``pubkey`` authored the thread's ROOT, is posting an
+        in-thread follow-up without mentioning anyone, AND this agent
+        participates in that thread.
 
         With flat anchoring, a human's in-thread reply e-tags the ROOT event
         (their own summons), not the agent's message — so ``_is_reply_to_self``
         can't recognize it, and requiring a fresh @mention on every turn would
-        break no-mention follow-ups inside a summoned thread. Ownership of the
-        root is a structural, prose-independent "you are talking to me": the
-        thread exists because its owner summoned an agent into it.
+        break no-mention follow-ups inside a summoned thread.
+
+        Participation is REQUIRED: without it the owner exemption applies to
+        every agent watching the channel, so one un-mentioned follow-up fans
+        out to all of them (observed 2026-08-19: a root summons addressed to
+        SADmin pulled Pepper into the thread on the owner's next reply).
+        Participation is recorded when the gate admits a dispatch, when we
+        send into a thread, and from channel history on startup.
 
         An agent's OWN messages never take this path (they are suppressed as
         self-echo earlier), and another AGENT posting in someone else's thread
@@ -1358,10 +1395,34 @@ class BuzzAdapter(BasePlatformAdapter):
         dispatching each other's narration.
         """
         root_id = self._thread_root_id(event)
-        if not root_id:
+        if not root_id or root_id not in self._participating_threads:
             return False
         root_author = self._event_authors.get(root_id)
         return bool(root_author) and root_author == pubkey and pubkey != self._self_pubkey
+
+    def _remember_participation(self, thread_root_id: Optional[str]) -> None:
+        """Record that this agent participates in thread ``thread_root_id``.
+
+        Bounded FIFO (same order of magnitude as the seen/author caches) so
+        long-running gateways don't grow unbounded.
+        """
+        if not thread_root_id:
+            return
+        self._participating_threads[str(thread_root_id)] = None
+        while len(self._participating_threads) > _SEEN_CAP:
+            self._participating_threads.popitem(last=False)
+
+    def _event_p_tags_self(self, event: dict) -> bool:
+        """True when the event structurally p-tags this agent's pubkey."""
+        for tag in event.get("tags") or []:
+            if (
+                isinstance(tag, (list, tuple))
+                and len(tag) >= 2
+                and tag[0] == "p"
+                and str(tag[1]).lower() == self._self_pubkey
+            ):
+                return True
+        return False
 
     def _is_mentioned(self, content: str) -> bool:
         """True when the message addresses this agent (npub, hex, or @name).
