@@ -1135,12 +1135,20 @@ class BuzzAdapter(BasePlatformAdapter):
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch. A threaded reply that p-tags us (replying TO
         # our message; clients may render that mention invisibly) counts as
-        # addressed, same as a typed @mention.
+        # addressed, same as a typed @mention. The thread's owner (author of
+        # the root event) replying in their own thread without any mention is
+        # also addressed — flat anchoring means their reply e-tags the ROOT,
+        # not our message, so the reply-to-self path alone would miss it.
+        # NOTE: display-name matching requires an explicit '@' (see
+        # _is_mentioned) — prose references ("SADmin's handiwork") must NOT
+        # pass the gate, or two agents participating in the same thread
+        # dispatch each other's narration forever.
         if (
             not is_dm
             and self.require_mention
             and not self._is_mentioned(content)
             and not self._is_reply_to_self(event)
+            and not self._is_thread_owner_followup(event, pubkey)
         ):
             return
 
@@ -1157,32 +1165,9 @@ class BuzzAdapter(BasePlatformAdapter):
         dispatch_text = self._strip_mention(content)
 
         # ── Thread support (NIP-10) ────────────────────────────────────────
-        # Replies carry e tags anchoring the thread. Prefer an explicit
-        # ``root`` marker (clients may order tags arbitrarily, and a nested
-        # reply carries BOTH root+reply — first-tag-wins would grab the wrong
-        # one); fall back to the first e-tag (single-reply-marker form, where
-        # the reply target of a direct reply IS the root).
-        root_event_id = None
-        for tag in event.get("tags") or []:
-            if (
-                isinstance(tag, (list, tuple))
-                and len(tag) >= 4
-                and tag[0] == "e"
-                and str(tag[3]).lower() == "root"
-                and tag[1]
-            ):
-                root_event_id = str(tag[1])
-                break
-        if root_event_id is None:
-            for tag in event.get("tags") or []:
-                if (
-                    isinstance(tag, (list, tuple))
-                    and len(tag) >= 2
-                    and tag[0] == "e"
-                    and tag[1]
-                ):
-                    root_event_id = str(tag[1])
-                    break
+        # Replies carry e tags anchoring the thread; _thread_root_id prefers
+        # an explicit ``root`` marker and falls back to the first e-tag.
+        root_event_id = self._thread_root_id(event)
 
         # Session/thread keying (see build_session_key in gateway/session.py):
         #   * DMs key sessions by chat_id alone — a thread_id here would SPLIT
@@ -1323,15 +1308,78 @@ class BuzzAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    def _thread_root_id(self, event: dict) -> Optional[str]:
+        """The thread root this event belongs to, per NIP-10.
+
+        Prefers an explicit ``root`` marker (clients may order tags
+        arbitrarily, and a nested reply carries BOTH root+reply — first-tag
+        -wins would grab the wrong one); falls back to the first e-tag (the
+        single-reply-marker form, where the reply target of a direct reply
+        IS the root). Returns None for root-level (unthreaded) messages.
+        """
+        root_event_id = None
+        for tag in event.get("tags") or []:
+            if (
+                isinstance(tag, (list, tuple))
+                and len(tag) >= 4
+                and tag[0] == "e"
+                and str(tag[3]).lower() == "root"
+                and tag[1]
+            ):
+                root_event_id = str(tag[1])
+                break
+        if root_event_id is None:
+            for tag in event.get("tags") or []:
+                if (
+                    isinstance(tag, (list, tuple))
+                    and len(tag) >= 2
+                    and tag[0] == "e"
+                    and tag[1]
+                ):
+                    root_event_id = str(tag[1])
+                    break
+        return root_event_id
+
+    def _is_thread_owner_followup(self, event: dict, pubkey: str) -> bool:
+        """True when ``pubkey`` authored the thread's ROOT and is now posting
+        an in-thread follow-up without mentioning anyone.
+
+        With flat anchoring, a human's in-thread reply e-tags the ROOT event
+        (their own summons), not the agent's message — so ``_is_reply_to_self``
+        can't recognize it, and requiring a fresh @mention on every turn would
+        break no-mention follow-ups inside a summoned thread. Ownership of the
+        root is a structural, prose-independent "you are talking to me": the
+        thread exists because its owner summoned an agent into it.
+
+        An agent's OWN messages never take this path (they are suppressed as
+        self-echo earlier), and another AGENT posting in someone else's thread
+        does not match either (it did not author the root) — which is exactly
+        the discriminator that keeps two agents in one thread from endlessly
+        dispatching each other's narration.
+        """
+        root_id = self._thread_root_id(event)
+        if not root_id:
+            return False
+        root_author = self._event_authors.get(root_id)
+        return bool(root_author) and root_author == pubkey and pubkey != self._self_pubkey
+
     def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+        """True when the message addresses this agent (npub, hex, or @name).
+
+        The display-name form REQUIRES an explicit leading ``@``: prose
+        references ("SADmin's handiwork", "ask Pepper about that") name the
+        agent without addressing it, and matching those makes any two agents
+        sharing a thread dispatch each other's messages forever (each reply
+        mentions the other's name in passing). Pubkey/npub forms stay plain
+        substring matches — they cannot appear in prose by accident.
+        """
         lowered = content.lower()
         if self._self_pubkey and self._self_pubkey in lowered:
             return True
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@{re.escape(self._display_name.lower())}(?!\w)"
             if re.search(pattern, lowered):
                 return True
         return False
