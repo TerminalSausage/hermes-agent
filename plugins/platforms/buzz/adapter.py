@@ -642,6 +642,20 @@ class BuzzAdapter(BasePlatformAdapter):
         # reply_to (no thread context = root-level summons) still creates the
         # thread off the summoning message.
         reply_target = (metadata or {}).get("thread_id") or reply_to
+        # Fork-model spawn: a message whose text begins with "[fork]" is a
+        # delegation brief — it must land TOP-LEVEL (becoming its own thread
+        # root), never threaded under the current conversation (a threaded
+        # brief fails the worker's _fork_is_brief parser, and a raw-CLI
+        # workaround skips caller-side registration, unsuppressing worker
+        # chatter). The adapter stamps the parent reference from the current
+        # thread context so the model never needs to know event ids. This is
+        # the spawn-side mirror of the [return] reroute below.
+        if content.lstrip().startswith(_FORK_TOKEN):
+            fork_parent = (metadata or {}).get("thread_id") or reply_to
+            if fork_parent:
+                if "(forked-from" not in content:
+                    content = content.rstrip() + f" (forked-from {fork_parent})"
+                reply_target = None
         # Fork-model return routing: a "[return]"-prefixed message sent from
         # inside a fork WE spawned is rerouted to the fork's PARENT scope —
         # the delegation result lands in the parent thread, not the fork.
