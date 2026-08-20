@@ -92,6 +92,13 @@ _CHAT_KIND = 9
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
 _SEEN_CAP = 500
+
+# Fork-model delegation constants. A "fork" is a top-level brief post that
+# seeds a new thread scope for a delegated task; the adapter tracks the
+# parent-child relationship so returns can be routed and depth capped.
+_FORK_TOKEN = "[fork]"          # machine-readable marker in the brief text
+_FORK_MAX_DEPTH = 3             # DK: 3-4 is sufficient
+_FORK_REGISTRY_CAP = 500        # bounded, same order as _SEEN_CAP
 # Re-run DM discovery (``dms list`` plus the channels-list fallback) every
 # N poll sweeps to pick up conversations opened mid-run.
 _DM_DISCOVERY_EVERY = 5
@@ -441,6 +448,11 @@ class BuzzAdapter(BasePlatformAdapter):
         # summons for ANOTHER agent never pulls this one into the thread
         # (2026-08-19: @SADmin summons + owner follow-up dragged Pepper in).
         self._participating_threads: "OrderedDict[str, None]" = OrderedDict()
+        # fork/brief event id -> {"parent": <scope id>, "caller": <pubkey>,
+        # "depth": int}. Threads spawned as delegation forks (top-level
+        # briefs) whose results must return to the caller's parent scope.
+        # Bounded FIFO; re-seeded from channel history on restart.
+        self._fork_registry: "OrderedDict[str, dict]" = OrderedDict()
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
@@ -630,6 +642,17 @@ class BuzzAdapter(BasePlatformAdapter):
         # reply_to (no thread context = root-level summons) still creates the
         # thread off the summoning message.
         reply_target = (metadata or {}).get("thread_id") or reply_to
+        # Fork-model return routing: a "[return]"-prefixed message sent from
+        # inside a fork WE spawned is rerouted to the fork's PARENT scope —
+        # the delegation result lands in the parent thread, not the fork.
+        # The token is stripped; anything without it stays in the fork.
+        if content.lstrip().startswith("[return]"):
+            entry = self._fork_registry.get(str(reply_target)) if reply_target else None
+            if entry and entry.get("caller") == self._self_pubkey:
+                content = content.lstrip()[len("[return]"):].lstrip()
+                if not content:
+                    return SendResult(success=False, error="Empty message")
+                reply_target = entry["parent"]
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -651,6 +674,29 @@ class BuzzAdapter(BasePlatformAdapter):
             if reply_target:
                 # We just sent into this thread: we participate in it.
                 self._remember_participation(str(reply_target))
+            else:
+                # Caller-side fork registration: a top-level brief we authored
+                # seeds a new fork scope. Register it so (a) the worker's
+                # structural replies stay suppressed on our side, and (b) our
+                # own "[return]" messages can be rerouted to the parent.
+                m = re.search(r"\(forked-from ([0-9a-fA-F]{64})\)", content)
+                if _FORK_TOKEN in content and m:
+                    parent_scope = m.group(1)
+                    depth = self._fork_depth(parent_scope) + 1
+                    if depth > _FORK_MAX_DEPTH or self._fork_is_ancestor(
+                        parent_scope, str(event_id)
+                    ):
+                        # Refuse the spawn: post nothing further, unregister
+                        # the (already sent) brief by simply not registering
+                        # it, and report so the agent handles it directly.
+                        return SendResult(
+                            success=False,
+                            error=(
+                                f"fork refused: depth cap {_FORK_MAX_DEPTH} exceeded "
+                                f"(would be {depth})"
+                            ),
+                        )
+                    self._fork_register(str(event_id), parent_scope, self._self_pubkey, depth)
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
@@ -1066,6 +1112,28 @@ class BuzzAdapter(BasePlatformAdapter):
                     isinstance(hist_content, str) and self._is_mentioned(hist_content)
                 ):
                     self._remember_participation(str(event_id))
+        # Fork-registry seeding: briefs (any author) rebuild the fork tree
+        # after a restart. Processed in created_at order so a fork-of-fork
+        # sees its parent brief registered first (depth chaining is
+        # chronological by construction).
+        seeded_briefs: list = []
+        for hist_event in _parse_json_list(out):
+            brief = self._fork_is_brief(hist_event)
+            if brief:
+                seeded_briefs.append(
+                    (
+                        int(hist_event.get("created_at") or 0),
+                        str(hist_event.get("id")),
+                        brief,
+                    )
+                )
+        for _ts, brief_id, brief in sorted(seeded_briefs, key=lambda t: t[0]):
+            self._fork_register(
+                brief_id,
+                brief["parent"],
+                brief["caller"],
+                self._fork_depth(brief["parent"]) + 1,
+            )
         self._trim_seen(state)
 
     async def _discover_dms(self, *, seed: bool) -> None:
@@ -1169,11 +1237,26 @@ class BuzzAdapter(BasePlatformAdapter):
         # _is_mentioned) — prose references ("SADmin's handiwork") must NOT
         # pass the gate, or two agents participating in the same thread
         # dispatch each other's narration forever.
+        # Thread root is needed by the gate now (fork-model suppression
+        # checks the fork registry), so compute it before gating.
+        root_event_id = self._thread_root_id(event)
+
+        # Fork-model: detect a top-level delegation brief authored by another
+        # agent. A brief only dispatches when it MENTIONS us (the worker
+        # summons); unmentioned briefs are other agents' orchestration and
+        # fall through the gate silently.
+        fork_brief = None
+        if not is_dm and pubkey != self._self_pubkey:
+            fork_brief = self._fork_is_brief(event)
+
         if (
             not is_dm
             and self.require_mention
             and not self._is_mentioned(content)
-            and not self._is_reply_to_self(event)
+            and not (
+                self._is_reply_to_self(event)
+                and not self._fork_suppress_structural(root_event_id)
+            )
             and not self._is_thread_owner_followup(event, pubkey)
         ):
             return
@@ -1190,11 +1273,54 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
-        # ── Thread support (NIP-10) ────────────────────────────────────────
-        # Replies carry e tags anchoring the thread; _thread_root_id prefers
-        # an explicit ``root`` marker and falls back to the first e-tag.
-        root_event_id = self._thread_root_id(event)
+        # ── Fork-model wiring ──────────────────────────────────────────────
+        # A brief that reached here addressed us: we are the worker being
+        # summoned into a fresh fork scope. Register the fork (worker side)
+        # and tell the agent how to behave inside it.
+        fork_note = ""
+        if fork_brief:
+            parent_scope = fork_brief["parent"]
+            depth = self._fork_depth(parent_scope) + 1
+            if depth > _FORK_MAX_DEPTH or self._fork_is_ancestor(parent_scope, event_id):
+                # Depth cap / cycle: refuse the delegation with a canned
+                # (non-LLM) reply that @-mentions the caller, so the caller
+                # learns immediately instead of timing out.
+                caller_name = await self._resolve_user_name(fork_brief["caller"])
+                await self.send(
+                    channel_id,
+                    f"@{caller_name} [fork-refused] delegation depth cap "
+                    f"({_FORK_MAX_DEPTH}) exceeded — handle this one directly "
+                    f"or reuse an existing fork.",
+                )
+                return
+            self._fork_register(event_id, parent_scope, fork_brief["caller"], depth)
+            fork_note = (
+                f"\n\n[delegation] You were summoned into this fork by "
+                f"{await self._resolve_user_name(fork_brief['caller'])} "
+                f"(fork depth {depth}/{_FORK_MAX_DEPTH}, parent thread "
+                f"{parent_scope[:8]}). Do the work here; this thread's scope "
+                f"is isolated from the parent. When you have a result, post "
+                f"it IN THIS THREAD mentioning the caller by name."
+            )
 
+        # A dispatch whose thread is a fork WE spawned means the worker just
+        # @-mentioned us back: this is a delegation RETURN. The session here
+        # holds the full fork context (the brief + worker chatter) — exactly
+        # what's needed to compose the parent summary.
+        if root_event_id:
+            entry = self._fork_registry.get(root_event_id)
+            if entry and entry.get("caller") == self._self_pubkey and pubkey != self._self_pubkey:
+                fork_note = (
+                    f"\n\n[delegation-return] Worker result arriving in fork "
+                    f"{root_event_id[:8]} (parent thread "
+                    f"{entry['parent'][:8]}). Compose your summary and deliver "
+                    f"it to the PARENT thread by prefixing that message with "
+                    f"[return] — the adapter reroutes it. Replies without the "
+                    f"token stay in this fork; the parent conversation resumes "
+                    f"in the parent session."
+                )
+
+        # ── Thread support (NIP-10) ────────────────────────────────────────
         # Session/thread keying (see build_session_key in gateway/session.py):
         #   * DMs key sessions by chat_id alone — a thread_id here would SPLIT
         #     a threaded DM conversation across two sessions, so DMs never
@@ -1205,7 +1331,8 @@ class BuzzAdapter(BasePlatformAdapter):
         #     id its first reply will anchor to. This keeps turn 1 (summons)
         #     and turns 2+ (inside the spawned thread) in ONE session, and
         #     gives interim/status/media sends a thread_id to anchor to on
-        #     turn 1, before any reply exists.
+        #     turn 1, before any reply exists. A fork brief follows the same
+        #     rule: the brief event IS the fork's root and session key.
         if is_dm:
             dispatch_thread_id = None
         else:
@@ -1217,7 +1344,7 @@ class BuzzAdapter(BasePlatformAdapter):
             self._remember_participation(dispatch_thread_id)
 
         await self._dispatch_message(
-            text=dispatch_text,
+            text=dispatch_text + fork_note,
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=pubkey,
@@ -1411,6 +1538,84 @@ class BuzzAdapter(BasePlatformAdapter):
         self._participating_threads[str(thread_root_id)] = None
         while len(self._participating_threads) > _SEEN_CAP:
             self._participating_threads.popitem(last=False)
+
+    # ── Fork-model delegation (recursive sub-thread orchestration) ─────────
+    #
+    # DK's recursion model (2026-08-19): an orchestrator summoned in a parent
+    # thread delegates by posting a TOP-LEVEL brief that @mentions the worker
+    # agent. The brief is its own thread root (the CLI flattens --reply-to
+    # nesting, so scopes must be created as top-level posts), giving the
+    # worker a session isolated from the parent conversation. The worker's
+    # chatter stays in the fork; results return via @mention of the caller,
+    # which dispatches the caller in the fork scope holding the full fork
+    # context. Depth is capped (_FORK_MAX_DEPTH) and cyclic re-entry into
+    # ancestor scopes is refused.
+
+    def _fork_entry(self, fork_id: str) -> Optional[dict]:
+        """Registry entry for ``fork_id``: {"parent": <id>, "caller": <pubkey>, "depth": int}."""
+        return self._fork_registry.get(str(fork_id))
+
+    def _fork_depth(self, scope_id: str) -> int:
+        """Depth of ``scope_id``: 0 for a plain parent thread (not a fork), 1+ for forks."""
+        entry = self._fork_registry.get(str(scope_id))
+        return int(entry["depth"]) if entry else 0
+
+    def _fork_is_ancestor(self, scope_id: str, ancestor_id: str) -> bool:
+        """True when ``scope_id``'s fork chain contains ``ancestor_id`` (cycle guard)."""
+        cur: Optional[str] = str(scope_id)
+        seen: set = set()
+        while cur:
+            if cur in seen:
+                break
+            seen.add(cur)
+            if cur == str(ancestor_id):
+                return True
+            entry = self._fork_registry.get(cur)
+            cur = entry["parent"] if entry else None
+        return False
+
+    def _fork_is_descendant(self, scope_id: str, of: str) -> bool:
+        """True when ``scope_id`` lies anywhere below ``of`` in the fork tree."""
+        return self._fork_is_ancestor(of, scope_id)
+
+    def _fork_register(self, fork_id: str, parent_id: str, caller: str, depth: int) -> None:
+        """Record a fork: its parent scope, the delegating caller (return
+        address), and its depth. Bounded FIFO like the other registries."""
+        if not fork_id or not parent_id:
+            return
+        rid = str(fork_id)
+        self._fork_registry[rid] = {
+            "parent": str(parent_id),
+            "caller": str(caller).lower(),
+            "depth": max(1, int(depth)),
+        }
+        while len(self._fork_registry) > _FORK_REGISTRY_CAP:
+            self._fork_registry.popitem(last=False)
+
+    def _fork_is_brief(self, event: dict) -> Optional[dict]:
+        """Parse a top-level brief authored by ANOTHER agent.
+
+        A valid fork brief is a root-level (unthreaded) chat event whose
+        content carries the ``[fork]`` marker and a ``(forked-from <id>)``
+        reference. Returns {"parent": <id>, "caller": <pubkey>} or None.
+        """
+        if self._thread_root_id(event):
+            return None  # threaded reply, not a top-level brief
+        content = event.get("content")
+        if not isinstance(content, str) or _FORK_TOKEN not in content:
+            return None
+        m = re.search(r"\(forked-from ([0-9a-fA-F]{64})\)", content)
+        if not m:
+            return None
+        return {"parent": m.group(1), "caller": str(event.get("pubkey") or "").lower()}
+
+    def _fork_suppress_structural(self, root_id: Optional[str]) -> bool:
+        """True when ``root_id`` is a fork WE spawned — the worker's flat
+        replies in it e-tag our brief and must NOT count as "replying to us"
+        (``_is_reply_to_self``), or every worker message would flood the
+        delegator. Only explicit mentions / p-tag returns may cross back."""
+        entry = self._fork_registry.get(str(root_id)) if root_id else None
+        return bool(entry) and entry.get("caller") == self._self_pubkey
 
     def _event_p_tags_self(self, event: dict) -> bool:
         """True when the event structurally p-tags this agent's pubkey."""
