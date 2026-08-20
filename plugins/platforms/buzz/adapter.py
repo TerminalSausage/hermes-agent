@@ -99,6 +99,12 @@ _SEEN_CAP = 500
 _FORK_TOKEN = "[fork]"          # machine-readable marker in the brief text
 _FORK_MAX_DEPTH = 3             # DK: 3-4 is sufficient
 _FORK_REGISTRY_CAP = 500        # bounded, same order as _SEEN_CAP
+# Return-gap wake-up: a fork whose worker went quiet without @mentioning
+# the caller gets harvested after this wall-clock gap (the mention-free
+# message is held pending by the gate; per-message nudging is impossible
+# by construction since mention-free events never dispatch).
+_FORK_NUDGE_GAP = 90.0
+_FORK_NUDGE_POLL = 15.0         # sweep cadence (worst-case +15s skew)
 # Re-run DM discovery (``dms list`` plus the channels-list fallback) every
 # N poll sweeps to pick up conversations opened mid-run.
 _DM_DISCOVERY_EVERY = 5
@@ -431,6 +437,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # Runtime state
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
+        # Fork-return sweep task (runs on every transport; see _fork_nudge_loop)
+        self._fork_nudge_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
@@ -453,6 +461,12 @@ class BuzzAdapter(BasePlatformAdapter):
         # briefs) whose results must return to the caller's parent scope.
         # Bounded FIFO; re-seeded from channel history on restart.
         self._fork_registry: "OrderedDict[str, dict]" = OrderedDict()
+        # fork_id -> {"last_worker_msg": <event dict>, "ts": <epoch float>} —
+        # mention-free worker messages inside forks WE spawned. The gate holds
+        # them (they address nobody), so the return becomes PROMPT-COMPLIANCE
+        # FREE: a gap loop harvests the pending return once the fork goes
+        # quiet and wakes the caller in fork scope to compose [return].
+        self._fork_pending: "OrderedDict[str, dict]" = OrderedDict()
         self._channel_names: Dict[str, str] = {}
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
@@ -579,6 +593,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
+        # Fork-return sweep runs on BOTH transports (the poll loop is not
+        # started in websocket mode, and the WS loop's async-for blocks on
+        # idle sockets — only a timer task guarantees sweep cadence).
+        self._fork_nudge_task = asyncio.create_task(self._fork_nudge_loop())
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -619,6 +637,13 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        if self._fork_nudge_task and not self._fork_nudge_task.done():
+            self._fork_nudge_task.cancel()
+            try:
+                await self._fork_nudge_task
+            except asyncio.CancelledError:
+                pass
+        self._fork_nudge_task = None
         self._channel_state = {}
         self._poll_count = 0
 
@@ -642,19 +667,39 @@ class BuzzAdapter(BasePlatformAdapter):
         # reply_to (no thread context = root-level summons) still creates the
         # thread off the summoning message.
         reply_target = (metadata or {}).get("thread_id") or reply_to
-        # Fork-model spawn: a message whose text begins with "[fork]" is a
-        # delegation brief — it must land TOP-LEVEL (becoming its own thread
-        # root), never threaded under the current conversation (a threaded
-        # brief fails the worker's _fork_is_brief parser, and a raw-CLI
-        # workaround skips caller-side registration, unsuppressing worker
-        # chatter). The adapter stamps the parent reference from the current
-        # thread context so the model never needs to know event ids. This is
-        # the spawn-side mirror of the [return] reroute below.
-        if content.lstrip().startswith(_FORK_TOKEN):
+        # Fork-model spawn: anywhere the text contains "[fork]" is a brief —
+        # models routinely NARRATE before the token ("Dispatching now: [fork]
+        # @Worker …") and a prefix-only check silently degrades the fork into
+        # a threaded reply (observed live 2026-08-20: the brief threaded into
+        # the parent, @Worker inside it summoned the worker into the PARENT
+        # scope, and the answer landed in the human's thread). Split instead:
+        # narration BEFORE the token stays threaded where the human sees it;
+        # the brief (token onward) goes out top-level with the parent stamp.
+        idx = content.find(_FORK_TOKEN)
+        if idx != -1 and "(forked-from" not in content:
             fork_parent = (metadata or {}).get("thread_id") or reply_to
+            brief = content[idx:].strip()
             if fork_parent:
-                if "(forked-from" not in content:
-                    content = content.rstrip() + f" (forked-from {fork_parent})"
+                content = content[:idx].rstrip()
+                brief = brief.rstrip() + f" (forked-from {fork_parent})"
+            if not content:
+                # Pure brief (no narration): single top-level send.
+                content = brief
+                reply_target = None
+            else:
+                # Narrated brief: send narration threaded, then the brief as
+                # its own top-level post.
+                narr_args = list(args) + (
+                    ["--reply-to", str(reply_target)] if reply_target else []
+                )
+                n_code, _n_out, n_err = await self._run_cli(narr_args, input_text=content)
+                if n_code != 0:
+                    return SendResult(
+                        success=False,
+                        error=_cli_error_message(n_err, n_code),
+                        retryable=n_code == 2,
+                    )
+                content = brief
                 reply_target = None
         # Fork-model return routing: a "[return]"-prefixed message sent from
         # inside a fork WE spawned is rerouted to the fork's PARENT scope —
@@ -1068,6 +1113,20 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
+    async def _fork_nudge_loop(self) -> None:
+        """Timer loop driving _fork_nudge_sweep on every transport."""
+        try:
+            while True:
+                await asyncio.sleep(_FORK_NUDGE_POLL)
+                try:
+                    await self._fork_nudge_sweep()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Buzz: fork nudge sweep failed", exc_info=True)
+        except asyncio.CancelledError:
+            raise
+
     async def _poll_loop(self) -> None:
         """Poll every watched channel for new events until cancelled."""
         try:
@@ -1273,6 +1332,20 @@ class BuzzAdapter(BasePlatformAdapter):
             )
             and not self._is_thread_owner_followup(event, pubkey)
         ):
+            # Mention-free in a fork WE spawned: this is a candidate RETURN.
+            # Hold it (per-message nudging is impossible — the gate never
+            # dispatches mention-free events) and let the gap sweep harvest
+            # it once the fork goes quiet; a later @mention/p-tag return
+            # supersedes and clears the pending entry.
+            if (
+                root_event_id
+                and self._fork_suppress_structural(root_event_id)
+                and pubkey != self._self_pubkey
+            ):
+                self._fork_pending[root_event_id] = {
+                    "last_worker_msg": event,
+                    "ts": time.monotonic(),
+                }
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
@@ -1324,6 +1397,9 @@ class BuzzAdapter(BasePlatformAdapter):
         if root_event_id:
             entry = self._fork_registry.get(root_event_id)
             if entry and entry.get("caller") == self._self_pubkey and pubkey != self._self_pubkey:
+                # A real mention/p-tag return supersedes any pending
+                # mention-free harvest for this fork.
+                self._fork_pending.pop(root_event_id, None)
                 fork_note = (
                     f"\n\n[delegation-return] Worker result arriving in fork "
                     f"{root_event_id[:8]} (parent thread "
@@ -1630,6 +1706,60 @@ class BuzzAdapter(BasePlatformAdapter):
         delegator. Only explicit mentions / p-tag returns may cross back."""
         entry = self._fork_registry.get(str(root_id)) if root_id else None
         return bool(entry) and entry.get("caller") == self._self_pubkey
+
+    async def _fork_nudge_sweep(self) -> None:
+        """Periodic sweep: wake the caller in forks whose worker went quiet.
+
+        The return-by-mention protocol is prompt-compliance dependent (the
+        worker must remember to @mention the caller; observed live
+        2026-08-20: SADmin answered in the fork WITHOUT a ping and the stack
+        never unwound). The gate holds mention-free worker messages as
+        pending returns (see ``_handle_event``); this loop harvests them
+        after a quiet gap so the caller can compose ``[return]`` without
+        any worker cooperation. The dispatch mirrors a mention return: fork
+        scope (session holds full fork context), worker as author, and the
+        [delegation-return] note instructing the [return] compose.
+        """
+        if not self._fork_pending:
+            return
+        for fork_id, pend in list(self._fork_pending.items()):
+            entry = self._fork_registry.get(fork_id)
+            if not entry or entry.get("caller") != self._self_pubkey:
+                self._fork_pending.pop(fork_id, None)
+                continue
+            if time.monotonic() - pend["ts"] < _FORK_NUDGE_GAP:
+                continue
+            self._fork_pending.pop(fork_id, None)
+            ev = pend["last_worker_msg"]
+            # Find the channel this fork lives in (its brief's h tag).
+            channel_id = None
+            for tag in ev.get("tags") or []:
+                if isinstance(tag, (list, tuple)) and len(tag) >= 2 and tag[0] == "h":
+                    channel_id = str(tag[1])
+                    break
+            if not channel_id:
+                continue
+            worker_pub = str(ev.get("pubkey") or "").lower()
+            note = (
+                "[return-gate] The worker's latest message in this fork "
+                "addressed no one — treated as the delegation result. "
+                "Summarize it for the parent thread by replying with a "
+                "message starting [return]; the adapter reroutes it. "
+                "Replies without the token stay in this fork."
+            )
+            try:
+                await self._dispatch_message(
+                    text=note + "\n\n" + str(ev.get("content") or ""),
+                    chat_id=channel_id,
+                    chat_type="group",
+                    user_id=worker_pub,
+                    user_name=await self._resolve_user_name(worker_pub),
+                    message_id=str(ev.get("id") or ""),
+                    created_at=int(ev.get("created_at") or 0),
+                    thread_id=fork_id,
+                )
+            except Exception:
+                logger.warning("Buzz: fork-return harvest failed for %s", fork_id[:8])
 
     def _event_p_tags_self(self, event: dict) -> bool:
         """True when the event structurally p-tags this agent's pubkey."""
