@@ -712,6 +712,19 @@ class BuzzAdapter(BasePlatformAdapter):
                 if not content:
                     return SendResult(success=False, error="Empty message")
                 reply_target = entry["parent"]
+            elif reply_target:
+                # Returns now dispatch in the PARENT scope; a model that
+                # still emits the token there just gets it stripped (the
+                # reply already targets the parent thread).
+                for e in self._fork_registry.values():
+                    if (
+                        e.get("caller") == self._self_pubkey
+                        and e.get("parent") == str(reply_target)
+                    ):
+                        content = content.lstrip()[len("[return]"):].lstrip()
+                        if not content:
+                            return SendResult(success=False, error="Empty message")
+                        break
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -1319,6 +1332,9 @@ class BuzzAdapter(BasePlatformAdapter):
         # summons); unmentioned briefs are other agents' orchestration and
         # fall through the gate silently.
         fork_brief = None
+        # Set when a delegation return is rerouted to the parent scope (see
+        # the [delegation-return] block below) — overrides thread keying.
+        return_parent: Optional[str] = None
         if not is_dm and pubkey != self._self_pubkey:
             fork_brief = self._fork_is_brief(event)
 
@@ -1400,14 +1416,21 @@ class BuzzAdapter(BasePlatformAdapter):
                 # A real mention/p-tag return supersedes any pending
                 # mention-free harvest for this fork.
                 self._fork_pending.pop(root_event_id, None)
+                # Dispatch into the PARENT scope, not the fork. Observed live
+                # 2026-08-20: composing the return in a fork session left the
+                # PARENT session (the human's conversation) ignorant of the
+                # worker's findings — the next human message in the parent
+                # thread hit task amnesia and swerved off-course. The parent
+                # session must ingest the result; the fork is the worker's
+                # scratch space only.
+                return_parent = entry["parent"]
                 fork_note = (
-                    f"\n\n[delegation-return] Worker result arriving in fork "
-                    f"{root_event_id[:8]} (parent thread "
-                    f"{entry['parent'][:8]}). Compose your summary and deliver "
-                    f"it to the PARENT thread by prefixing that message with "
-                    f"[return] — the adapter reroutes it. Replies without the "
-                    f"token stay in this fork; the parent conversation resumes "
-                    f"in the parent session."
+                    f"\n\n[delegation-return] Worker result from fork "
+                    f"{root_event_id[:8]} (relayed below). You are in the "
+                    f"parent thread — relay or act on this result for the "
+                    f"user with a normal reply HERE; no [return] token "
+                    f"needed. The delegation is complete; continue the "
+                    f"parent conversation with full context."
                 )
 
         # ── Thread support (NIP-10) ────────────────────────────────────────
@@ -1426,7 +1449,9 @@ class BuzzAdapter(BasePlatformAdapter):
         if is_dm:
             dispatch_thread_id = None
         else:
-            dispatch_thread_id = root_event_id or event_id
+            # A delegation return overrides the thread key: it dispatches in
+            # the PARENT scope so the human's session ingests the result.
+            dispatch_thread_id = return_parent or root_event_id or event_id
             # The gate admitted this event (mention / reply-to-self /
             # owner follow-up in a thread we participate in): we are (now)
             # a participant in this thread, so the owner's FUTURE un-mentioned
@@ -1740,12 +1765,13 @@ class BuzzAdapter(BasePlatformAdapter):
             if not channel_id:
                 continue
             worker_pub = str(ev.get("pubkey") or "").lower()
+            parent_scope = entry["parent"]
             note = (
-                "[return-gate] The worker's latest message in this fork "
-                "addressed no one — treated as the delegation result. "
-                "Summarize it for the parent thread by replying with a "
-                "message starting [return]; the adapter reroutes it. "
-                "Replies without the token stay in this fork."
+                f"[delegation-return] The worker's latest message in fork "
+                f"{fork_id[:8]} addressed no one — treated as the delegation "
+                f"result (relayed below). Relay it to the user in THIS parent "
+                f"thread with a normal reply; no [return] token needed. "
+                f"Continue the parent conversation with full context."
             )
             try:
                 await self._dispatch_message(
@@ -1756,7 +1782,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     user_name=await self._resolve_user_name(worker_pub),
                     message_id=str(ev.get("id") or ""),
                     created_at=int(ev.get("created_at") or 0),
-                    thread_id=fork_id,
+                    thread_id=parent_scope,
                 )
             except Exception:
                 logger.warning("Buzz: fork-return harvest failed for %s", fork_id[:8])
