@@ -367,6 +367,12 @@ class BuzzAdapter(BasePlatformAdapter):
     Instantiated by the adapter_factory passed to register_platform().
     """
 
+    # Nostr events are immutable: there is no edit API on the relay, so the
+    # streaming consumer's edit-based preview (and its cursor strip) can
+    # never succeed. Declaring this makes the gateway skip streaming for
+    # Buzz instead of leaving stuck ▉ cursors and split tail messages.
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(self, config, **kwargs):
         platform = Platform("buzz")
         super().__init__(config=config, platform=platform)
