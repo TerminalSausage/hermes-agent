@@ -975,6 +975,37 @@ class WebhookAdapter(BasePlatformAdapter):
                         override["base_url"] = str(route_base_url)
                     cleaned = sanitize_model_override(override)
                     if cleaned:
+                        # Mirror the stock persisted-override rehydration in
+                        # gateway/run.py: enrich the sanitized override with
+                        # the provider's full runtime resolution (api_mode,
+                        # credential_pool, api_key) so the turn builds the
+                        # correct wire protocol — e.g. openai-codex needs
+                        # codex_responses, not chat_completions, or the Codex
+                        # backend 404s. In-memory only; session persistence
+                        # re-sanitizes to model/provider/base_url.
+                        override_provider = cleaned.get("provider")
+                        if override_provider:
+                            try:
+                                from gateway.run import (
+                                    _resolve_runtime_agent_kwargs_for_provider,
+                                )
+
+                                rt = _resolve_runtime_agent_kwargs_for_provider(
+                                    str(override_provider)
+                                )
+                                for _rk in ("api_mode", "credential_pool", "api_key"):
+                                    _rv = rt.get(_rk)
+                                    if _rv:
+                                        cleaned[_rk] = _rv
+                                if not cleaned.get("base_url") and rt.get("base_url"):
+                                    cleaned["base_url"] = rt["base_url"]
+                            except Exception:
+                                logger.warning(
+                                    "[webhook] Runtime resolution failed for route %s provider %s",
+                                    route_name,
+                                    override_provider,
+                                    exc_info=True,
+                                )
                         # Session key must be resolved the same way the turn
                         # itself will resolve it, so the override lands on the
                         # exact session that processes this delivery.
