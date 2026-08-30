@@ -1068,7 +1068,7 @@ def drain_truncation_warnings() -> list:
 # per profile × platform), so the old cap of 8 could thrash on a gateway multiplexing default + several bots
 # (each miss = full os.walk manifest rebuild). ~32 costs low single-digit MB worst case.
 _SKILLS_PROMPT_CACHE_MAX = 32
-_SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
+_SKILLS_PROMPT_CACHE: OrderedDict[tuple, tuple[str, list[dict]]] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2 added org provenance fields (org_id/org_author); older snapshots are rebuilt.
 _SKILLS_SNAPSHOT_VERSION = 2
@@ -1228,8 +1228,53 @@ def build_skills_system_prompt(
         project_dirs = get_project_skills_dirs()
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""
-        return _build_skills_system_prompt_inner(
+        result, _entries = _build_skills_system_prompt_inner(
             skills_dir, external_dirs, available_tools, available_toolsets, compact_categories, project_dirs)
+        return result
+    finally:
+        if _home_token is not None:
+            reset_hermes_home_override(_home_token)
+
+
+
+def get_visible_skill_entries(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+    compact_categories: "frozenset[str] | None" = None,
+    skills_dir_override: "Path | None" = None,
+) -> list[dict]:
+    """Return filtered visible entries from the skills snapshot pipeline.
+
+    These are the same entries that ``build_skills_system_prompt`` uses
+    for the system-prompt skill index, after platform/environment/disabled
+    filtering.  Designed for use by the trigger-based skill loader.
+
+    When any filter parameter is ``None`` the corresponding gate accepts
+    all skills (backward compat — identical to the default index build).
+    """
+    if skills_dir_override is not None:
+        skills_dir = Path(skills_dir_override)
+        _home_token = set_hermes_home_override(str(skills_dir.parent))
+    else:
+        skills_dir = get_skills_dir()
+        _home_token = None
+    try:
+        external_dirs = get_all_skills_dirs()[1:]
+        from agent.skill_utils import get_project_skills_dirs
+        project_dirs = get_project_skills_dirs()
+
+        if not skills_dir.exists() and not external_dirs and not project_dirs:
+            return []
+
+        _, visible = _build_skills_system_prompt_inner(
+            skills_dir,
+            external_dirs,
+            available_tools,
+            available_toolsets,
+            compact_categories,
+            project_dirs=project_dirs,
+        )
+        return visible
     finally:
         if _home_token is not None:
             reset_hermes_home_override(_home_token)
@@ -1345,8 +1390,9 @@ def _build_skills_system_prompt_inner(
     skills_dir: "Path", external_dirs: "list[Path]", available_tools: "set[str] | None",
     available_toolsets: "set[str] | None", compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
-) -> str:
-    # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
+) -> tuple[str, list[dict]]:
+    # Include the resolved platform so per-platform disabled-skill lists
+    # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
@@ -1360,6 +1406,11 @@ def _build_skills_system_prompt_inner(
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+            # Old-format cached strings get wrapped to maintain the
+            # (result, visible_entries) contract.
+            if isinstance(cached, str):
+                cached = (cached, [])
+                _SKILLS_PROMPT_CACHE[cache_key] = cached
             return cached
 
     def hides(frontmatter_name: str, skill_name: str, conditions: dict) -> bool:
@@ -1414,11 +1465,11 @@ def _build_skills_system_prompt_inner(
 
     result = _render_skills_index(skills_by_category, category_descriptions, compact_categories, available_tools)
     with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE[cache_key] = result
+        _SKILLS_PROMPT_CACHE[cache_key] = (result, visible_entries)
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)
-    return result
+    return result, visible_entries
 
 
 def _truncate_content(

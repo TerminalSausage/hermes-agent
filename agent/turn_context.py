@@ -79,16 +79,29 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
 
 
 def compose_user_api_content(
-    content: Any, ext_prefetch_cache: str, plugin_user_context: str
+    content: Any,
+    ext_prefetch_cache: str,
+    plugin_user_context: str,
+    triggered_skill_context: str = "",
 ) -> Optional[str]:
     """Compose the API-bound content of the current turn's user message.
 
     Single source for the ``api_content`` sidecar and the wire bytes so they never drift
     (what turn N sends is what turn N+1 replays). ``None`` when nothing is injected."""
     if not isinstance(content, str):
-        return None
-    fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
-    injections = [part for part in (fenced, plugin_user_context) if part]
+        res = None
+    else:
+        injections = []
+        if ext_prefetch_cache:
+            fenced = build_memory_context_block(ext_prefetch_cache)
+            if fenced:
+                injections.append(fenced)
+        if plugin_user_context:
+            injections.append(plugin_user_context)
+        if triggered_skill_context:
+            injections.append(triggered_skill_context)
+        res = (content + "\n\n" + "\n\n".join(injections)) if injections else None
+    return res
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
@@ -793,6 +806,7 @@ def _memory_turn_start_and_prefetch(
 def _stamp_api_content_sidecar(
     agent: Any, messages: List[Any], current_turn_user_idx: int, ext_prefetch_cache: str,
     plugin_user_context: str, *, preflight_compressed: bool,
+    triggered_skill_context: str = "",
 ) -> None:
     """api_content sidecar — persist what you send: injected context lives only in the
     API copy, so stamp the exact sent bytes on the live dict for replay."""
@@ -802,7 +816,8 @@ def _stamp_api_content_sidecar(
     # Match the row the flush wrote (persist override = clean transcript), not the live bytes.
     durable_content, _api_content = durable_user_row_content(
         agent, _turn_user_msg, live_content,
-        compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context),
+        compose_user_api_content(live_content or "", ext_prefetch_cache, plugin_user_context,
+                                 triggered_skill_context=triggered_skill_context),
     )
     if _api_content is None or _api_content == durable_content:
         return
@@ -989,6 +1004,35 @@ def build_turn_context(
     _bind_interrupt_scope(agent, ra)
     ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
 
+    # ── Trigger-based skill auto-loading (fork, #23963) ────────────────
+    # Evaluate skill trigger patterns against the user message text.
+    # Reuses canonical filtering from prompt_builder — no parallel scanner.
+    # Injected via the api_content sidecar (same cache-safe path as memory).
+    triggered_skill_context = ""
+    try:
+        if isinstance(user_message, str) and user_message.strip():
+            from agent.skill_trigger_loader import (
+                format_triggered_skill_content,
+                get_triggered_skills,
+            )
+            from agent.prompt_builder import get_visible_skill_entries
+
+            _entries = get_visible_skill_entries()
+            if _entries:
+                _matched = get_triggered_skills(user_message, _entries)
+                if _matched:
+                    blocks = [
+                        format_triggered_skill_content(e) for e in _matched
+                    ]
+                    blocks = [b for b in blocks if b]
+                    if blocks:
+                        triggered_skill_context = (
+                            "\n\n[Triggered skills for this request:]\n\n"
+                            + "\n\n".join(blocks)
+                        )
+    except Exception:
+        logger.debug("Skill trigger evaluation failed", exc_info=True)
+
     # Sidecar skipped for codex_app_server/MoA.
     if (
         not moa_active
@@ -999,6 +1043,7 @@ def build_turn_context(
         _stamp_api_content_sidecar(
             agent, messages, current_turn_user_idx, ext_prefetch_cache,
             plugin_user_context, preflight_compressed=compaction.compressed,
+            triggered_skill_context=triggered_skill_context,
         )
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
