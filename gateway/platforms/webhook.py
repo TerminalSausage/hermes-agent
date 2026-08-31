@@ -949,6 +949,84 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         if profile and isinstance(profile, str):
             source.profile = profile
+
+        # Per-route model override (fork). A route may pin the model/provider
+        # used for its spawned session via "model" / "provider" keys (e.g. an
+        # external review bot on a stronger provider than the gateway default).
+        # Values are written through the STOCK session-override machinery —
+        # sanitize_model_override strips anything but model/provider/base_url,
+        # credentials still resolve from the profile's auth store at runtime,
+        # and _evict_cached_agent ensures the next turn builds a fresh agent.
+        # Webhook session keys embed the per-delivery delivery_id, so the
+        # override is naturally scoped to this one delivery's session.
+        route_model = route_config.get("model")
+        if route_model:
+            try:
+                from gateway.session import sanitize_model_override
+
+                runner = self.gateway_runner
+                if runner is not None:
+                    override = {"model": str(route_model)}
+                    route_provider = route_config.get("provider")
+                    if route_provider:
+                        override["provider"] = str(route_provider)
+                    route_base_url = route_config.get("base_url")
+                    if route_base_url:
+                        override["base_url"] = str(route_base_url)
+                    cleaned = sanitize_model_override(override)
+                    if cleaned:
+                        # Mirror the stock persisted-override rehydration in
+                        # gateway/run.py: enrich the sanitized override with
+                        # the provider's full runtime resolution (api_mode,
+                        # credential_pool, api_key) so the turn builds the
+                        # correct wire protocol — e.g. openai-codex needs
+                        # codex_responses, not chat_completions, or the Codex
+                        # backend 404s. In-memory only; session persistence
+                        # re-sanitizes to model/provider/base_url.
+                        override_provider = cleaned.get("provider")
+                        if override_provider:
+                            try:
+                                from gateway.run import (
+                                    _resolve_runtime_agent_kwargs_for_provider,
+                                )
+
+                                rt = _resolve_runtime_agent_kwargs_for_provider(
+                                    str(override_provider)
+                                )
+                                for _rk in ("api_mode", "credential_pool", "api_key"):
+                                    _rv = rt.get(_rk)
+                                    if _rv:
+                                        cleaned[_rk] = _rv
+                                if not cleaned.get("base_url") and rt.get("base_url"):
+                                    cleaned["base_url"] = rt["base_url"]
+                            except Exception:
+                                logger.warning(
+                                    "[webhook] Runtime resolution failed for route %s provider %s",
+                                    route_name,
+                                    override_provider,
+                                    exc_info=True,
+                                )
+                        # Session key must be resolved the same way the turn
+                        # itself will resolve it, so the override lands on the
+                        # exact session that processes this delivery.
+                        key_fn = getattr(runner, "_session_key_for_source", None)
+                        if key_fn is not None:
+                            ov_key = key_fn(source)
+                            if ov_key:
+                                runner._session_state(ov_key).conversation.model_override = cleaned
+                                runner._evict_cached_agent(ov_key)
+                                logger.info(
+                                    "[webhook] Route %s model override: %s (session %s)",
+                                    route_name,
+                                    cleaned.get("model"),
+                                    ov_key,
+                                )
+            except Exception:
+                logger.warning(
+                    "[webhook] Failed to apply route model override for %s",
+                    route_name,
+                    exc_info=True,
+                )
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
