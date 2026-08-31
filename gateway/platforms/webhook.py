@@ -853,8 +853,18 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
+        #
+        # The dedupe key is scoped to the ROUTE, not just the delivery ID:
+        # providers like GitHub fan a single event out to every hook URL
+        # registered on a repo, and all copies carry the SAME delivery GUID
+        # (X-GitHub-Delivery).  Keying on the bare GUID made sibling routes
+        # race — whichever hook's POST landed first processed the event and
+        # every other route's copy was discarded as a "duplicate retry",
+        # silently dropping notifications.  Retries hit the same route and
+        # still dedupe; sibling hooks each get their own cache entry.
+        route_scoped_id = f"{route_name}:{delivery_id}"
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        if not self._record_delivery_id(route_scoped_id, now):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
